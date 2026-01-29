@@ -24,5 +24,5 @@ Institute.
 I do not claim ownership of this software.  The sole intent of this repository is
 to establish a point in time for the source code, preserving the final state of
 ESPHamClock, and to act as a baseline for any future development that might take
-place.  Refer to the (PROVENANCE.md)[ARTIFACTS/PROVENANCE.md] file for more
+place.  Refer to the [PROVENANCE.md](ARTIFACTS/PROVENANCE.md) file for more
 information regarding this repository.
