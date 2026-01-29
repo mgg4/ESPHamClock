@@ -2,6 +2,12 @@
 
 This is a snapshot of the latest source distribution from Clear Sky Institute.
 
+Take note!  This is for the front-end only.  Much of the functionality of HamClock
+is provided by a back-end server, the code for which is/was owned by Elwood Downey.
+A separate search and/or inquiry must be made to gain access to this code.  If this
+is not possible, then there is nothing we can do on this front-end code to preserve
+HamClock going foward.
+
 With the passing of Elwood Downey (WB0OEW) it was important to capture this version 
 right away.  This ensures a stable checkpoint from which any future development can
 take place.
