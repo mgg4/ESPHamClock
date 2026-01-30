@@ -27,6 +27,16 @@ of the repository as the final state of the source distribution from Clear Sky
 Institute.
 6. Created this README.md.
 
+## FOLLOWUP PROCESS
+
+After the initial checkin, further research showed that the version of the code in
+the generic ESPHamClock.zip file was a much earlier version.  Research led me to
+the correct zip file for the 4.22 version.  This was downloaded, merged into the
+source directory, and the ARTIFACTS updated appropriately.  I left the initial
+import tagged, however that tag actually reflects the 2.80 version.  An additional
+tag will be placed on the repository to reflect the actual 4.22 release.
+
+
 I do not claim ownership of this software.  The sole intent of this repository is
 to establish a point in time for the source code, preserving the final state of
 ESPHamClock, and to act as a baseline for any future development that might take
