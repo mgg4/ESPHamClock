@@ -12,7 +12,7 @@ With the passing of Elwood Downey (WB0OEW) it was important to capture this vers
 right away.  This ensures a stable checkpoint from which any future development can
 take place.
 
-## Process
+## PROCESS
 
 Here is what I did to create this clean repo.
 
@@ -36,6 +36,27 @@ source directory, and the ARTIFACTS updated appropriately.  I left the initial
 import tagged, however that tag actually reflects the 2.80 version.  An additional
 tag will be placed on the repository to reflect the actual 4.22 release.
 
+# TAGS
+
+There are currently two tags in the repo:
+* freebsd-distcash-2.80 
+  * This tag reflects the initial basline established with the ESPHamClock.zip file
+    which turned out to contain version 2.80.
+* clear-sky-final-V4.22,unmodified
+  * This is the basline for all future maintenance and development.  The src directory
+    at this point reflects the actual state of the V4.22 release from Clear Sky.
+
+# ARTIFACTS
+
+The actual ESPHamClock-V4.22.zip file is available as an artifact in the ARTIFACTS
+directory of this repo.  Anyone wishing to download this may do so here.  Also note
+that at the time of this writing, the following URL also works to download the file
+directly from the clearskyinstitute.com website:
+
+https://clearskyinstitute.com/ham/HamClock/ESPHamClock-V4.22.zip
+
+
+# OWNERSHIP
 
 I do not claim ownership of this software.  The sole intent of this repository is
 to establish a point in time for the source code, preserving the final state of
