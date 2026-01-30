@@ -26,3 +26,7 @@ CommitDate: Thu Jan 29 13:18:07 2026 -0800
 Initial commit checksum:
 bf47b701863c144a9d0b3b7362eb6b275aa794c5
 
+Additional research after initial check-in showed an older version had been
+captured.  The correct zip file for v4.22 has been located and placed into the
+repo.  The CHECKSUM.txt file has been updated with the checksums for the correct
+file.
