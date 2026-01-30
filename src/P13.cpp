@@ -25,7 +25,9 @@
 //
 
 // Added a few select DateTime overloaded operators and _DATETIME_UNITTEST      -- ECD
+// Added _TLE_UNITTEST
 
+#include "HamClock.h"
 #include "P13.h"
 
 // here are a bunch of constants that will be used throughout the
@@ -40,30 +42,30 @@ static const float GM = 3.986E5f ;
 static const float J2 = 1.08263E-3f ;
 static const float YM = 365.25f ;
 static const float YT = 365.2421874f ;
-static const float WW = 2.f*M_PI/YT ;
-static const float WE = 2.f*M_PI+ WW ;
+static const float WW = 2.f*M_PIF/YT ;
+static const float WE = 2.f*M_PIF+ WW ;
 static const float W0 = WE/86400.f ;
 static const float YG = 2014.f ;
 static const float G0 = 99.5828f ;
 static const float MAS0 = 356.4105f ;
 static const float MASD = 0.98560028f ;
-static const float EQC1 = 0.03340 ;
-static const float EQC2 = 0.00035 ;
-static const float INS = (23.4375f)*M_PI/180.0 ;
+static const float EQC1 = 0.03340f;
+static const float EQC2 = 0.00035f;
+static const float INS = (23.4375f)*M_PIF/180.0f;
 static const float CNS = cosf(INS) ;
 static const float SNS = sinf(INS) ;
 
 
-float
+static float
 RADIANS(float deg)
 {
-    return deg * M_PI / 180. ;
+    return deg * M_PIF / 180. ;
 }
 
-float
+static float
 DEGREES(float rad)
 {
-    return rad * 180. / M_PI ;
+    return rad * 180. / M_PIF ;
 }
 
 
@@ -306,7 +308,7 @@ Satellite::tle(const char *l1, const char *l2)
     EC = getfloat(l2, 26, 33)/1e7f ;
     WP = RADIANS(getfloat(l2, 34, 42)) ;
     MA = RADIANS(getfloat(l2, 43, 51)) ;
-    MM = 2.0f * M_PI * getfloat(l2, 52, 63) ;
+    MM = 2.0f * M_PIF * getfloat(l2, 52, 63) ;
     RV = getlong(l2, 63, 68) ;
 
     // derived quantities from the orbital elements 
@@ -340,8 +342,8 @@ Satellite::predict(const DateTime &dt)
     float KDP = 1.F - 7.F * DT ;
   
     float M = MA + MM * T * (1.F - 3.F * DT) ;
-    float DR = (long) (M / (2.F * M_PI)) ;
-    M -= DR * 2.F * M_PI ;
+    float DR = (long) (M / (2.F * M_PIF)) ;
+    M -= DR * 2.F * M_PIF ;
     float EA = M ;
 
     float DNOM, C_EA, S_EA ;
@@ -475,7 +477,7 @@ float
 Satellite::period()
 {
     // MM is radians per day -> 1/MM is days/radian -> mult by 2PI to get days/rev
-    return ((2*M_PI)/MM);
+    return ((2*M_PIF)/MM);
 }
 
 // return great-circle radius from subsat point to viewing circle at given altitude
@@ -517,7 +519,7 @@ Sun::predict(const DateTime &dt)
 
     float T = (float) (DN - fnday(YG, 1, 0)) + TN ;
     float GHAE = RADIANS(G0) + T * WE ;
-    float MRSE = RADIANS(G0) + T * WW + M_PI ;
+    float MRSE = RADIANS(G0) + T * WW + M_PIF ;
     float MASE = RADIANS(MAS0 + T * MASD) ;
     float TAS = MRSE + EQC1*sinf(MASE) + EQC2*sinf(2.F*MASE) ;
     float C, S ;
@@ -576,3 +578,70 @@ int main (int ac, char *av[])
 }
 
 #endif // _DATETIME_UNITTEST
+
+#if defined (_TLE_UNITTEST)
+
+// build with g++ -o P13-tel-test -D_TLE_UNITTEST -IArduinoLib P13.cpp 
+
+int main (int ac, char *av[])
+{
+    if (ac == 1) {
+
+        // use a static test
+
+        const char t1[] = "1 25544U 98067A   24149.51140801  .00018442  00000+0  32372-3 0  9998";
+        const char t2[] = "2 25544  51.6397  52.8338 0005655 239.3246 313.5976 15.50566673455497";
+        Satellite *sat = new Satellite (t1, t2);
+
+        Observer *obs = new Observer (32.3565, -111.1327, 1);
+
+        DateTime dt(2024,05,29,0,0,0);
+
+        sat->predict (dt);
+
+        float el, az, range, rate;
+        sat->topo (obs, el, az, range, rate);
+        printf ("el %g =?= -19.3676\n", el);
+        printf ("az %g =?= 285.308\n", az);
+
+        float lat, lng;
+        sat->geo (lat, lng);
+        printf ("lat %g =?= 31.6874\n", DEGREES(lat));
+        printf ("lng %g =?= -167.405\n", DEGREES(lng));
+
+    } else if (ac == 5) {
+
+        // use the given tle lines evalated here and now
+
+        const char *t1 = av[3];
+        const char *t2 = av[4];
+
+        Satellite *sat = new Satellite (t1, t2);
+
+        Observer *obs = new Observer (atof(av[1]), atof(av[2]), 0);
+
+        time_t tnow = time(NULL);
+        struct tm tmnow = *gmtime (&tnow);
+        DateTime dt(tmnow.tm_year+1900, tmnow.tm_mon+1, tmnow.tm_mday, tmnow.tm_hour, tmnow.tm_min, tmnow.tm_sec);
+
+        sat->predict (dt);
+
+        float el, az, range, rate;
+        sat->topo (obs, el, az, range, rate);
+        printf ("el %g\n", el);
+        printf ("az %g\n", az);
+
+        float lat, lng;
+        sat->geo (lat, lng);
+        printf ("lat %g\n", DEGREES(lat));
+        printf ("lng %g\n", DEGREES(lng));
+
+    } else {
+
+        fprintf (stderr, "static test: %s\n", av[0]);
+        fprintf (stderr, "now test: %s lat lng tle1 tle2\n", av[0]);
+    }
+
+    return (0);
+}
+#endif // _TLE_UNITTEST

@@ -94,11 +94,10 @@ bool maidenhead2ll (LatLong &ll, const char maid[MAID_CHARLEN])
     else if (uc_maid[4] < 'A' || uc_maid[4] > 'X' || uc_maid[5] < 'A' || uc_maid[5] > 'X')
         return (false);
 
+    // ok
     ll.lng_d = 20.0F*(uc_maid[0] - 'A') + 2.0F*(uc_maid[2] - '0') + (5.0F/60.0F)*(uc_maid[4] - 'A') + - 180;
-    ll.lng = deg2rad (ll.lng_d);
-
     ll.lat_d = 10.0F*(uc_maid[1] - 'A') + 1.0F*(uc_maid[3] - '0') + (2.5F/60.0F)*(uc_maid[5] - 'A') + - 90;
-    ll.lat = deg2rad (ll.lat_d);
+    ll.normalize();
 
     return (true);
 }
@@ -117,26 +116,11 @@ void setNVMaidenhead(NV_Name nv, LatLong &ll)
 }
 
 /* return the given maidenhead value from NV.
- * use *OLD version if new one not set yet
  */
 void getNVMaidenhead (NV_Name nv, char maid[MAID_CHARLEN])
 {
-    if (!NVReadString (nv, maid)) {
-        // new value never used yet, try to set from old values
-        NV_Name old_nv = nv == NV_DE_GRID ? NV_DE_GRID_OLD : NV_DX_GRID_OLD;
-        uint32_t old_grid;
-        if (NVReadUInt32 (old_nv, &old_grid)) {
-            // unpack as 4 chars
-            memcpy (maid, &old_grid, 4);
-            maid[5] = 0;
-        } else {
-            // no old either, return 0/0
-            LatLong ll;
-            ll.lat_d = ll.lng_d = 0;
-            ll2maidenhead (maid, ll);
-        }
-        NVWriteString (nv, maid);
-    }
+    if (!NVReadString (nv, maid))
+        fatalError ("getNVMaidenhead invalid %d", (int)nv);
 }
 
 #endif // !_UNIT_TEST

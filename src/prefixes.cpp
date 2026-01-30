@@ -1,11 +1,46 @@
+/* manage prefixes and mapping them to/from lat/lng.
+ * 
+ * we actually use two different lists. a short one in memory for LL->prefix and a much longer one
+ * based on AC1D's cty file for prefix->LL. TODO: use cty for both but needs some clever sort for speed.
+ */
+
 #include "HamClock.h"
 
-typedef struct {
-    char prefix[MAX_PREF_LEN];            // prefix, left justified, \0 padded but none if full
-    int16_t lat, lng;                     // rough center, degs*100 +E +N
-} Prefix;
 
-static const Prefix prefixes[] PROGMEM = {
+/* prefixes are cached with fast radix access
+ */
+
+static char cty_page[] = "/cty/cty_wt_mod-ll-dxcc.txt";         // web page to download
+static char cty_fn[] = "cty-ll-dxcc.txt";                       // local cache copy name
+
+typedef struct {
+    char call[MAX_SPOTCALL_LEN];                // mostly prefixes, a few calls; sorted ala strcmp
+    float lat_d, lng_d;                         // +N +E degrees
+    int call_len;                               // handy strlen(call)
+    int dxcc;                                   // DXCC number
+} CtyLoc;
+static CtyLoc *cty_list;                        // malloced list
+static int n_cty, n_malloc;                     // n entries used, n malloced
+#define _N_RADIX ('Z' - '0' + 1)                // radix range, 
+static int cty_radix[_N_RADIX];                 // table of cty_list index from first character
+static char prev_radix;                         // used to detect change in radis index
+static time_t next_refresh;                     // time of next download
+#define MAX_CTY_AGE     (1*24*3600)             // normally update city file this often, secs
+#define MIN_CTY_SIZ     800000                  // min believable file size
+#define RETRY_DT        60                      // retry interval if trouble, secs
+#define MAX_DIST        12                      // max dist from target, degrees
+
+
+/* table of common prefixes and their rough center location.
+ */
+
+#define SMALL_PREF_LEN 4
+typedef struct {
+    char pref[SMALL_PREF_LEN];                  // prefix, left justified, \0 padded but none if full
+    int16_t lat, lng;                           // rough center, degs*100 +E +N
+} SmallPrefix;
+
+static const SmallPrefix small_prefs[] = {
      {{'1','A','\0','\0'},        4154,   1230},
      {{'1','S','\0','\0'},         839,  11129},
      {{'3','A','\0','\0'},        4345,    725},
@@ -15,8 +50,8 @@ static const Prefix prefixes[] PROGMEM = {
      {{'3','C','\0','\0'},         345,    847},
      {{'3','C','0','\0'},          128,    540},
      {{'3','D','2','\0'},        -1807,  17825},
-     {{'3','D','2','c'},         -2144,  17438},
-     {{'3','D','2','x'},         -1248,  17701},
+     {{'3','D','2','C'},         -2144,  17438},
+     {{'3','D','2','X'},         -1248,  17701},
      {{'3','D','A','\0'},        -2718,   3160},
      {{'3','V','\0','\0'},        3647,   1011},
      {{'3','W','\0','\0'},        1048,  10642},
@@ -27,8 +62,8 @@ static const Prefix prefixes[] PROGMEM = {
      {{'4','L','\0','\0'},        4143,   4449},
      {{'4','O','\0','\0'},        4244,   1926},
      {{'4','S','\0','\0'},         656,   7951},
-     {{'4','U','1','i'},          4612,    609},
-     {{'4','U','1','u'},          4043,  -7401},
+     {{'4','U','1','I'},          4612,    609},
+     {{'4','U','1','U'},          4043,  -7401},
      {{'4','W','\0','\0'},        -855,  12557},
      {{'4','X','\0','\0'},        3146,   3514},
      {{'5','A','\0','\0'},        3000,   1400},
@@ -112,8 +147,8 @@ static const Prefix prefixes[] PROGMEM = {
      {{'C','9','\0','\0'},       -1500,   3300},
      {{'C','9','\0','\0'},       -2200,   3400},
      {{'C','E','0','\0'},        -2706, -10921},
-     {{'C','E','0','x'},         -2504,  -8025},
-     {{'C','E','0','z'},         -3326,  -7841},
+     {{'C','E','0','X'},         -2504,  -8025},
+     {{'C','E','0','Z'},         -3326,  -7841},
      {{'C','E','1','\0'},        -2339,  -7023},
      {{'C','E','2','\0'},        -3304,  -7140},
      {{'C','E','3','\0'},        -3327,  -7040},
@@ -171,18 +206,18 @@ static const Prefix prefixes[] PROGMEM = {
      {{'F','K','\0','\0'},       -1900,  15800},
      {{'F','M','\0','\0'},        1436,  -6105},
      {{'F','O','\0','\0'},       -1753, -14956},
-     {{'F','O','a','\0'},        -2300, -15000},
-     {{'F','O','c','\0'},         1010, -10850},
-     {{'F','O','m','\0'},         -944, -13938},
+     {{'F','O','A','\0'},        -2300, -15000},
+     {{'F','O','C','\0'},         1010, -10850},
+     {{'F','O','M','\0'},         -944, -13938},
      {{'F','P','\0','\0'},        4655,  -5610},
      {{'F','R','\0','\0'},       -2052,   5528},
      {{'F','S','\0','\0'},        1809,  -6300},
-     {{'F','T','g','\0'},        -1131,   4718},
-     {{'F','T','j','\0'},        -1821,   4136},
-     {{'F','T','t','\0'},        -1557,   5421},
-     {{'F','T','w','\0'},        -4630,   5200},
-     {{'F','T','x','\0'},        -4912,   7000},
-     {{'F','T','z','\0'},        -3731,   7730},
+     {{'F','T','G','\0'},        -1131,   4718},
+     {{'F','T','J','\0'},        -1821,   4136},
+     {{'F','T','T','\0'},        -1557,   5421},
+     {{'F','T','W','\0'},        -4630,   5200},
+     {{'F','T','X','\0'},        -4912,   7000},
+     {{'F','T','Z','\0'},        -3731,   7730},
      {{'F','W','\0','\0'},       -1311, -17643},
      {{'F','Y','\0','\0'},         455,  -5220},
      {{'G','\0','\0','\0'},       5130,     10},
@@ -190,7 +225,7 @@ static const Prefix prefixes[] PROGMEM = {
      {{'G','I','\0','\0'},        5435,   -555},
      {{'G','J','\0','\0'},        4912,   -237},
      {{'G','M','\0','\0'},        5557,   -313},
-     {{'G','M','s','\0'},         6000,   -313},
+     {{'G','M','S','\0'},         6000,   -313},
      {{'G','U','\0','\0'},        4927,   -231},
      {{'G','W','\0','\0'},        5129,   -313},
      {{'H','4','\0','\0'},        -926,  15957},
@@ -206,7 +241,7 @@ static const Prefix prefixes[] PROGMEM = {
      {{'H','K','\0','\0'},         400,  -7000},
      {{'H','K','\0','\0'},         700,  -7500},
      {{'H','K','0','\0'},         1232,  -8142},
-     {{'H','K','0','m'},           409,  -8138},
+     {{'H','K','0','M'},           409,  -8138},
      {{'H','L','\0','\0'},        3733,  12658},
      {{'H','P','\0','\0'},         858,  -7931},
      {{'H','R','\0','\0'},        1406,  -8713},
@@ -255,24 +290,62 @@ static const Prefix prefixes[] PROGMEM = {
      {{'J','A','8','\0'},         4330,  14300},
      {{'J','A','9','\0'},         3640,  13713},
      {{'J','D','1','\0'},         2430,  15358},
-     {{'J','D','1','o'},          2648,  14219},
+     {{'J','D','1','O'},          2648,  14219},
      {{'J','T','\0','\0'},        4700,   9700},
      {{'J','T','\0','\0'},        4600,  10900},
      {{'J','W','\0','\0'},        7440,   1807},
      {{'J','X','\0','\0'},        7111,   -800},
      {{'J','Y','\0','\0'},        3157,   3556},
-     {{'K','0','\0','\0'},        3940,  -9700},
-     {{'K','1','\0','\0'},        4220,  -7105},
-     {{'K','2','\0','\0'},        4040,  -7350},
-     {{'K','3','\0','\0'},        3854,  -7700},
-     {{'K','4','\0','\0'},        3200,  -8400},
-     {{'K','5','\0','\0'},        3017,  -9745},
-     {{'K','6','\0','\0'},        4000, -12000},
-     {{'K','6','\0','\0'},        3400, -11600},
-     {{'K','7','\0','\0'},        4500, -11200},
-     {{'K','7','\0','\0'},        3300, -10900},
-     {{'K','8','\0','\0'},        3959,  -8303},
-     {{'K','9','\0','\0'},        3945,  -8610},
+     {{'K','0','\0','\0',},       3836,  -9246},     // Missouri
+     {{'K','0','\0','\0',},       3849,  -9838},     // Kansas
+     {{'K','0','\0','\0',},       3900, -10555},     // Colorado
+     {{'K','0','\0','\0',},       4154,  -9980},     // Nebraska
+     {{'K','0','\0','\0',},       4208,  -9350},     // Iowa
+     {{'K','0','\0','\0',},       4444, -10023},     // South Dakota
+     {{'K','0','\0','\0',},       4628,  -9431},     // Minnesota
+     {{'K','0','\0','\0',},       4745, -10047},     // North Dakota
+     {{'K','1','\0','\0',},       4162,  -7273},     // Connecticut
+     {{'K','1','\0','\0',},       4168,  -7156},     // Rhode Island
+     {{'K','1','\0','\0',},       4226,  -7181},     // Massachusetts
+     {{'K','1','\0','\0',},       4368,  -7158},     // New Hampshire
+     {{'K','1','\0','\0',},       4407,  -7267},     // Vermont
+     {{'K','1','\0','\0',},       4537,  -6924},     // Maine
+     {{'K','2','\0','\0',},       4019,  -7467},     // New Jersey
+     {{'K','2','\0','\0',},       4295,  -7553},     // New York
+     {{'K','3','\0','\0',},       3899,  -7551},     // Delaware
+     {{'K','3','\0','\0',},       3906,  -7679},     // Maryland
+     {{'K','3','\0','\0',},       4088,  -7780},     // Pennsylvania
+     {{'K','4','\0','\0',},       2863,  -8245},     // Florida
+     {{'K','4','\0','\0',},       3264,  -8344},     // Georgia
+     {{'K','4','\0','\0',},       3278,  -8683},     // Alabama
+     {{'K','4','\0','\0',},       3392,  -8090},     // South Carolina
+     {{'K','4','\0','\0',},       3556,  -7939},     // North Carolina
+     {{'K','4','\0','\0',},       3586,  -8635},     // Tennessee
+     {{'K','4','\0','\0',},       3752,  -7885},     // Virginia
+     {{'K','4','\0','\0',},       3753,  -8530},     // Kentucky
+     {{'K','5','\0','\0',},       3107,  -9200},     // Louisiana
+     {{'K','5','\0','\0',},       3148,  -9933},     // Texas
+     {{'K','5','\0','\0',},       3274,  -8967},     // Mississippi
+     {{'K','5','\0','\0',},       3441, -10611},     // New Mexico
+     {{'K','5','\0','\0',},       3489,  -9244},     // Arkansas
+     {{'K','5','\0','\0',},       3559,  -9749},     // Oklahoma
+     {{'K','6','\0','\0',},       3718, -11947},     // California
+     {{'K','7','\0','\0',},       3427, -11166},     // Arizona
+     {{'K','7','\0','\0',},       3931, -11167},     // Utah
+     {{'K','7','\0','\0',},       3933, -11663},     // Nevada
+     {{'K','7','\0','\0',},       4300, -10755},     // Wyoming
+     {{'K','7','\0','\0',},       4393, -12056},     // Oregon
+     {{'K','7','\0','\0',},       4435, -11461},     // Idaho
+     {{'K','7','\0','\0',},       4705, -10963},     // Montana
+     {{'K','7','\0','\0',},       4738, -12045},     // Washington
+     {{'K','8','\0','\0',},       3864,  -8062},     // West Virginia
+     {{'K','8','\0','\0',},       4029,  -8279},     // Ohio
+     {{'K','8','\0','\0',},       4435,  -8541},     // Michigan
+     {{'K','9','\0','\0',},       3989,  -8628},     // Indiana
+     {{'K','9','\0','\0',},       4004,  -8920},     // Illinois
+     {{'K','9','\0','\0',},       4462,  -8999},     // Wisconsin
+     {{'K','H','6','\0',},        2029, -15637},     // Hawaii
+     {{'K','L','7','\0',},        6407, -15228},     // Alaska
      {{'K','G','4','\0'},         1955,  -7506},
      {{'K','H','0','\0'},         1512,  14544},
      {{'K','H','1','\0'},            8, -17628},
@@ -281,7 +354,7 @@ static const Prefix prefixes[] PROGMEM = {
      {{'K','H','4','\0'},         2814, -17548},
      {{'K','H','5','\0'},          549, -16213},
      {{'K','H','6','\0'},         2118, -15751},
-     {{'K','H','7','k'},          2825, -17820},
+     {{'K','H','7','K'},          2825, -17820},
      {{'K','H','8','\0'},        -1416, -17042},
      {{'K','H','8','\0'},        -1150, -17108},
      {{'K','H','9','\0'},         1921,  16640},
@@ -341,9 +414,9 @@ static const Prefix prefixes[] PROGMEM = {
      {{'P','T','9','\0'},        -2027,  -5437},
      {{'P','V','8','\0'},          250,  -6043},
      {{'P','W','8','\0'},         -846,  -6354},
-     {{'P','Y','0','f'},           351,  -3225},
-     {{'P','Y','0','s'},            56,  -2934},
-     {{'P','Y','0','t'},         -2025,  -2924},
+     {{'P','Y','0','F'},           351,  -3225},
+     {{'P','Y','0','S'},            56,  -2934},
+     {{'P','Y','0','T'},         -2025,  -2924},
      {{'P','Y','1','\0'},        -2253,  -4317},
      {{'P','Y','2','\0'},        -2333,  -4639},
      {{'P','Y','3','\0'},        -3003,  -5110},
@@ -381,7 +454,7 @@ static const Prefix prefixes[] PROGMEM = {
      {{'R','1','T','\0'},         5831,   3117},
      {{'R','1','W','\0'},         5750,   2820},
      {{'R','1','Z','\0'},         6859,   3308},
-     {{'R','2','f','\0'},         5443,   2030},
+     {{'R','2','F','\0'},         5443,   2030},
      {{'R','3','A','\0'},         5545,   3735},
      {{'R','3','E','\0'},         5259,   3604},
      {{'R','3','G','\0'},         5237,   3935},
@@ -457,7 +530,7 @@ static const Prefix prefixes[] PROGMEM = {
      {{'S','V','\0','\0'},        3759,   2343},
      {{'S','V','5','\0'},         3626,   2813},
      {{'S','V','9','\0'},         3520,   2509},
-     {{'S','v','a','\0'},         4009,   2421},
+     {{'S','V','A','\0'},         4009,   2421},
      {{'T','2','\0','\0'},        -922,  17943},
      {{'T','3','0','\0'},          141,  17313},
      {{'T','3','1','\0'},         -505, -17043},
@@ -503,8 +576,8 @@ static const Prefix prefixes[] PROGMEM = {
      {{'V','E','7','\0'},         4825, -12322},
      {{'V','E','8','\0'},         6230, -11429},
      {{'V','E','9','\0'},         4557,  -6640},
-     {{'V','K','0','h'},         -5303,   7330},
-     {{'V','K','0','m'},         -5437,  15900},
+     {{'V','K','0','H'},         -5303,   7330},
+     {{'V','K','0','M'},         -5437,  15900},
      {{'V','K','1','\0'},        -3518,  14908},
      {{'V','K','2','\0'},        -3100,  14800},
      {{'V','K','3','\0'},        -3745,  14458},
@@ -513,24 +586,24 @@ static const Prefix prefixes[] PROGMEM = {
      {{'V','K','6','\0'},        -2500,  12200},
      {{'V','K','7','\0'},        -4254,  14718},
      {{'V','K','8','\0'},        -1800,  13200},
-     {{'V','K','9','c'},         -1140,   9651},
-     {{'V','K','9','l'},         -3133,  15905},
-     {{'V','K','9','m'},         -1700,  15500},
-     {{'V','K','9','n'},         -2852,  16756},
-     {{'V','K','9','w'},         -1614,  15000},
-     {{'V','K','9','x'},         -1030,  10540},
+     {{'V','K','9','C'},         -1140,   9651},
+     {{'V','K','9','L'},         -3133,  15905},
+     {{'V','K','9','M'},         -1700,  15500},
+     {{'V','K','9','N'},         -2852,  16756},
+     {{'V','K','9','W'},         -1614,  15000},
+     {{'V','K','9','X'},         -1030,  10540},
      {{'V','O','1','\0'},         4734,  -5241},
      {{'V','O','2','\0'},         5254,  -6650},
-     {{'V','P','2','e'},          1814,  -6305},
-     {{'V','P','2','m'},          1644,  -6214},
-     {{'V','P','2','v'},          1826,  -6437},
+     {{'V','P','2','E'},          1814,  -6305},
+     {{'V','P','2','M'},          1644,  -6214},
+     {{'V','P','2','V'},          1826,  -6437},
      {{'V','P','5','\0'},         2128,  -7108},
      {{'V','P','6','\0'},        -2440, -12447},
-     {{'V','P','8','f'},         -5145,  -5900},
-     {{'V','P','8','g'},         -5406,  -3658},
-     {{'V','P','8','h'},         -6255,  -6034},
-     {{'V','P','8','o'},         -6058,  -4558},
-     {{'V','P','8','s'},         -5741,  -2806},
+     {{'V','P','8','F'},         -5145,  -5900},
+     {{'V','P','0','\0'},        -5406,  -3658},
+     {{'V','P','0','\0'},        -6255,  -6034},
+     {{'V','P','0','\0'},        -6058,  -4558},
+     {{'V','P','0','\0'},        -5741,  -2806},
      {{'V','P','9','\0'},         3211,  -6445},
      {{'V','Q','9','\0'},         -519,   7228},
      {{'V','R','\0','\0'},        2217,  11409},
@@ -598,60 +671,318 @@ static const Prefix prefixes[] PROGMEM = {
      {{'Z','S','8','\0'},        -4649,   3947},
 };
 
-#define N_PREFIXES NARRAY(prefixes)
-#define MAX_R2   (11*11)          // max radius^2, sqr degrees
+#define N_SMALLPREFS NARRAY(small_prefs)
 
-/* find nearest prefix, if within allowed max
+
+/* find nearest small_prefs to the given LL, if within allowed max
+ * N.B. tried cty but it has way too many weird ones, eg it finds AX? instead of VK? and lots of
+ *   parochial US calls. Don't try it!
  */
-bool nearestPrefix (const LatLong &ll, char prefix[MAX_PREF_LEN+1])
+bool ll2Prefix (const LatLong &ll, char prefix[MAX_PREF_LEN])
 {
-    // cache
-    static LatLong prev_ll;
-    static char prev_prefix[MAX_PREF_LEN+1];
-    static bool prev_return;
-    if (memcmp (&ll, &prev_ll, sizeof(ll)) == 0) {
-        memcpy (prefix, prev_prefix, MAX_PREF_LEN+1);
-        return (prev_return);
-    }
-
-    // save query location
-    prev_ll = ll;
-
-    // scan for closest location
-    float mind2 = 1e10;
-    float coslat = cosf(ll.lat);
-    uint16_t closest_prefix = 0;
-    for (uint16_t i = 0; i < N_PREFIXES; i++) {
-        float dlat = ll.lat_d - 0.01F * (int16_t) pgm_read_word (&prefixes[i].lat);
-        float dlng = lngDiff(ll.lng_d - 0.01F * (int16_t) pgm_read_word (&prefixes[i].lng));
-        dlng *= coslat;
-        float d2 = dlat*dlat + dlng*dlng;
-        if (d2 < mind2) {
-            mind2 = d2;
-            closest_prefix = i;
+    // scan for closest location -- use simple linear approx
+    float mind = 1e10;                                  // min linear degree separation so far
+    float coslat = cosf(ll.lat);                        // handy
+    uint16_t closest_smpref = 0;                        // small_prefs index of closest entry
+    for (int i = 0; i < N_SMALLPREFS; i++) {
+        float dlat = fabsf (ll.lat_d - 0.01F * small_prefs[i].lat);
+        if (dlat < mind) {                              // dont bother adding dlng if already > mind
+            float dlng = coslat * fabsf (lngDiff (ll.lng_d - 0.01F * small_prefs[i].lng));
+            float d = dlat + dlng;
+            if (d < mind) {
+                mind = d;
+                closest_smpref = i;
+            }
         }
     }
 
     // fail if too far away
-    // Serial.printf ("mind2 = %g\n", mind2);
-    if (mind2 > MAX_R2) {
-        prev_return = false;
+    if (mind > MAX_DIST)
         return (false);
-    }
 
-    // float lat = (float) pgm_read_float (&prefixes[closest_prefix].lat),
-    // float lng = (float) pgm_read_float (&prefixes[closest_prefix].lng));
-
-    // create legitimate string
-    for (uint8_t i = 0; i < MAX_PREF_LEN; i++)
-        prefix[i] = (char) pgm_read_byte (&prefixes[closest_prefix].prefix[i]);
-    prefix[MAX_PREF_LEN] = '\0';
-
-    // save result
-    memcpy (prev_prefix, prefix, MAX_PREF_LEN+1);
-    prev_return = true;
+    // save in prefix[] as legitimate string
+    memset (prefix, 0, MAX_PREF_LEN);
+    memcpy (prefix, small_prefs[closest_smpref].pref, SMALL_PREF_LEN);
 
     // good
     return (true);
 }
 
+/* split a call into home and dx portions.
+ * if nothing looks like a dx portion then copy call to both.
+ * N.B. we assume call has already been cleaned with strTrimAll() and strtoupper()
+ */
+void splitCallSign (const char *raw_call, char home_call[NV_CALLSIGN_LEN], char dx_call[NV_CALLSIGN_LEN])
+{
+    // work with copy so we can remove any trailing -# from RBN
+    char call[NV_CALLSIGN_LEN];
+    quietStrncpy (call, raw_call, sizeof(call));
+    char *dash_pound = strstr (call, "-#");
+    if (dash_pound)
+        *dash_pound = '\0';
+
+    // split at slash, if any
+    const char *slash = strchr (call, '/');
+
+    if (slash) {
+
+        // find left and right boundaries
+        const char *left = call;                        // just handy
+        const char *right = slash+1;                    // beginning of right portion
+        int l_len = slash - left;                       // length of left portion
+        int r_len = strlen (right);                     // length of right portion
+        const char *slash2 = strchr (right, '/');
+        if (slash2)
+            r_len = slash2 - right;                      // don't count past a 2nd slash
+
+        // dx is the shorter side unless it looks like a common shorthand or seems suspicious
+
+        if (r_len <= 1 || !strcmp(right,"MM") || !strcmp(right,"AM")
+                       || (r_len > 2 && (int)strcspn(right,"0123456789") == r_len)      // 3+ all alpha
+                       || (int)strspn(right,"0123456789") > 1) {                        // 2+ leading digits
+
+            // disregard suspicious right side
+            snprintf (home_call, NV_CALLSIGN_LEN, "%.*s", l_len, left);
+            snprintf (dx_call, NV_CALLSIGN_LEN, "%.*s", l_len, left);
+
+        } else if (l_len <= r_len) {
+
+            // left is shorter, consider it the dx
+            snprintf (home_call, NV_CALLSIGN_LEN, "%.*s", r_len, right);
+            snprintf (dx_call, NV_CALLSIGN_LEN, "%.*s", l_len, left);
+
+        } else {
+
+            // right is shorter, consider it the dx
+            snprintf (home_call, NV_CALLSIGN_LEN, "%.*s", l_len, left);
+            snprintf (dx_call, NV_CALLSIGN_LEN, "%.*s", r_len, right);
+
+        }
+
+    } else {
+
+        // call is home, no dx
+        snprintf (home_call, NV_CALLSIGN_LEN, "%s", call);
+        snprintf (dx_call, NV_CALLSIGN_LEN, "%s", call);
+
+    }
+}
+
+/* extract the most likely portion from the given call that appears to be the dx prefix
+ */
+void findCallPrefix (const char *call, char prefix[MAX_PREF_LEN])
+{
+    // init prefix
+    memset (prefix, 0, MAX_PREF_LEN);
+
+    // protect from empty call
+    if (call[0] == '\0')
+        return;
+
+    // always work with the dx-end
+    char home_call[NV_CALLSIGN_LEN];
+    char dx_call[NV_CALLSIGN_LEN];
+    splitCallSign (call, home_call, dx_call);
+
+    // find rmd "right-most-digit" in dx_call
+    const char *rmd = NULL;
+    for (const char *cp = dx_call; *cp != '\0'; cp++)
+        if (isdigit(*cp))
+            rmd = cp;
+
+    // if no rmd:            use all; will likely fail call2LL()
+    // if rmd is first char: use first two chars
+    // else:                 use up to and including rmd
+    if (!rmd)
+        snprintf (prefix, MAX_PREF_LEN, "%.*s", MAX_PREF_LEN-1, dx_call);
+    else if (rmd == dx_call)
+        snprintf (prefix, MAX_PREF_LEN, "%.2s", dx_call);
+    else
+        snprintf (prefix, MAX_PREF_LEN, "%.*s", (int)(rmd - dx_call + 1), dx_call);
+
+    // printf ("************************ %10s %s\n", call, prefix);          // RBF
+}
+
+
+/***********************************************************************************
+ *
+ * cty file support
+ * 
+ ***********************************************************************************/
+
+/* init cty values for a fresh start
+ */
+static void initCty(void)
+{
+    if (cty_list)
+        free (cty_list);
+    cty_list = NULL;
+    n_cty = 0;
+    n_malloc = 0;
+}
+
+/* crack and add another line to cty_list
+ */
+static void addCtyLine (char *line)
+{
+    // skip blank and comment lines
+    if (line[0] == '\n' || line[0] == '#')
+        return;
+
+    // crack
+    CtyLoc cl;
+    if (sscanf (line, "%10s %f %f %d", cl.call, &cl.lat_d, &cl.lng_d, &cl.dxcc) != 4) {
+        Serial.printf ("CTY: %s bad format: %s\n", cty_page, line);
+        return;
+    }
+
+    // add to list, expanding as needed
+    if (n_cty + 1 > n_malloc) {
+        cty_list = (CtyLoc *) realloc (cty_list, (n_malloc += 1000) * sizeof(CtyLoc));
+        if (!cty_list)
+            fatalError ("No memory for cty location list %d\n", n_malloc);
+    }
+    cl.call_len = strlen(cl.call);
+    cty_list[n_cty++] = cl;
+
+    // update radix index when first char changes
+    if (cl.call[0] != prev_radix) {
+        int radix_index = cl.call[0] - '0';
+        if (radix_index < 0 || radix_index >= _N_RADIX)
+            fatalError ("cty radix out of range %d %d", radix_index, _N_RADIX);
+        cty_radix[radix_index] = n_cty - 1;
+        prev_radix = cl.call[0];
+        // printf ("********* radix %c %5d %5d\n",cl.call[0], radix_index, radix[radix_index]);
+    }
+}
+
+/* insure cty_lst and its supporting radix index are ready to use, even if stale if no other way.
+ * use local file but if absent or too old try to download.
+ * return whether cty_list is ready.
+ */
+static bool loadCtyFile(void)
+{
+    // out fast until next refresh
+    if (myNow() < next_refresh)
+        return (cty_list != NULL);
+
+    // open cached file
+    FILE *fp = openCachedFile (cty_fn, cty_page, MAX_CTY_AGE, MIN_CTY_SIZ);
+    if (!fp) {
+        next_refresh = myNow() + RETRY_DT;
+        return (false);
+    }
+
+    // (re)build cty_list
+    initCty();
+    char line[100];
+    while (fgets (line, sizeof(line), fp)) {
+        chompString (line);
+        addCtyLine (line);
+    }
+
+    // done
+    fclose (fp);
+    next_refresh = myNow() + MAX_CTY_AGE;
+    Serial.printf ("CTY: loaded %d locations from %s\n", n_cty, cty_fn);
+
+    // real question is whether cty_list exists
+    return (cty_list != NULL);
+}
+
+/* search for best CtyLoc for the given prefix.
+ * return pointer else NULL
+ */
+static const CtyLoc *searchCty (const char *prefix)
+{
+    // start at radix then find longest cty_list call entry that starts with prefix.
+    const CtyLoc *candidate = NULL;
+    int radix_index = prefix[0] - '0';
+    if (radix_index >= 0 && radix_index < _N_RADIX) {
+        int start = cty_radix[radix_index];
+        int len_match = 0;                              // find longest match
+        for (int i = start; i < n_cty; i++) {           // start at this radix, go to end or next radix
+            const CtyLoc *cp = &cty_list[i];
+            if (cp->call[0] != prefix[0])
+                break;                                  // end of this radix
+            if (strncmp (cp->call, prefix, cp->call_len) == 0) {
+                int cc_len = strlen(cp->call);
+                if (cc_len > len_match) {
+                    len_match = cc_len;
+                    candidate = cp;
+                    if (debugLevel (DEBUG_CTY, 1))
+                        Serial.printf ("CTY: match for %s now %s length %d\n", prefix, cp->call, len_match);
+                }
+            }
+        }
+    }
+
+    return (candidate);
+}
+
+
+/* given a call sign or prefix find its lat/long by querying the cty table.
+ * return whether successful.
+ */
+bool call2LL (const char *call, LatLong &ll)
+{
+    // check cty_list
+    if (!loadCtyFile())
+        return (false);
+
+    // use the dx end of a portable call
+    char home_call[NV_CALLSIGN_LEN];
+    char dx_call[NV_CALLSIGN_LEN];
+    splitCallSign (call, home_call, dx_call);
+
+    // require a digit if 3 or more chars
+    if (strlen(dx_call) >= 3 && !strHasDigit(dx_call)) {
+        Serial.printf ("CTY: no digit in %s\n", dx_call);
+        return (false);
+    }
+
+    const CtyLoc *candidate = searchCty (dx_call);
+
+    if (candidate) {
+        ll.lat_d = candidate->lat_d;
+        ll.lng_d = candidate->lng_d;
+        ll.normalize();
+        return (true);
+    } else {
+        // darn
+        if (strcmp (call, dx_call))
+            Serial.printf ("CTY: No location for %s AKA %s\n", dx_call, call);
+        else
+            Serial.printf ("CTY: No location for %s\n", call);
+        return (false);
+    }
+}
+
+/* given a call sign or prefix find its DXCC number by querying the cty table.
+ * return whether successful.
+ */
+bool call2DXCC (const char *call, int &dxcc)
+{
+    // check cty_list
+    if (!loadCtyFile())
+        return (false);
+
+    // use the dx end of a portable call
+    char home_call[NV_CALLSIGN_LEN];
+    char dx_call[NV_CALLSIGN_LEN];
+    splitCallSign (call, home_call, dx_call);
+
+    const CtyLoc *candidate = searchCty (dx_call);
+
+    if (candidate) {
+        dxcc = candidate->dxcc;
+        return (true);
+    } else {
+        // darn
+        if (strcmp (call, dx_call))
+            Serial.printf ("CTY: No DXCC for %s AKA %s\n", dx_call, call);
+        else
+            Serial.printf ("CTY: No DXCC for %s\n", call);
+        return (false);
+    }
+}
