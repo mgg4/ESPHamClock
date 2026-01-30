@@ -16,7 +16,6 @@
 #include "HamClock.h"
 
 // basic arrangement
-#define NPKB_ROWS       4               // actual keyboard rows
 #define NPKB_COLS       9               // actual keyboard cols
 #define NP_NBOXR        8               // total number of rows in box
 #define NP_FONTW        6               // fixed-width font width
@@ -52,7 +51,6 @@ typedef struct {
     uint8_t r;                  // row 0 .. NP_NBOXR-1
     char str[NPF_MAXLEN+1];     // user contents, including EOS
 } NPField;
-static const char ll_fmt[] = "%.6g%c";  // lat/long + dir format suitable within NPF_MAXLEN
 
 // field names
 typedef enum {
@@ -84,10 +82,8 @@ static int keyboardMap (int row, int col)
  */
 static void setNPLL (NPField f[NPF_N], const LatLong &ll)
 {
-    snprintf (f[NPF_LAT].str, sizeof(f[NPF_LAT].str), ll_fmt,
-                                            fabsf(ll.lat_d), ll.lat_d < 0 ? 'S' : 'N');
-    snprintf (f[NPF_LNG].str, sizeof(f[NPF_LNG].str), ll_fmt,
-                                            fabsf(ll.lng_d), ll.lng_d < 0 ? 'W' : 'E');
+    formatLat (ll.lat_d, f[NPF_LAT].str, sizeof(f[NPF_LAT].str));
+    formatLng (ll.lng_d, f[NPF_LNG].str, sizeof(f[NPF_LNG].str));
 }
 
 
@@ -146,7 +142,7 @@ static void eraseNPChar (const SBox &b, NPField &f)
         eraseNPFocus (b, f);
         f.str[--l] = '\0';
         uint16_t x = f.x + getTextWidth(f.str);
-        tft.fillRect (x, ROW2FY(b,f.r), NP_FONTW, NP_FONTH, RA8875_BLACK);
+        tft.fillRect (x, ROW2FY(b,f.r)-1, NP_FONTW, NP_FONTH+2, RA8875_BLACK);
         drawNPFocus (b, f);
     }
 }
@@ -260,7 +256,7 @@ static void initNPDialog (const SBox &box, NPField f[NPF_N], const LatLong &ll, 
 
     // finish setting up lat
     tft.setCursor (box.x+1, ROW2FY(box,0));
-    tft.print (F("Lat:"));
+    tft.print ("Lat:");
     f[NPF_LAT].x = box.x + 1 + 6*NP_FONTW;
     f[NPF_LAT].r = 0;
     drawNPField (box, f[NPF_LAT]);
@@ -268,14 +264,14 @@ static void initNPDialog (const SBox &box, NPField f[NPF_N], const LatLong &ll, 
 
     // finish setting up lng
     tft.setCursor (box.x+1, ROW2FY(box,1));
-    tft.print (F("Long:"));
+    tft.print ("Long:");
     f[NPF_LNG].x = box.x + 1 + 6*NP_FONTW;
     f[NPF_LNG].r = 1;
     drawNPField (box, f[NPF_LNG]);
 
     // grid
     tft.setCursor (box.x+1, ROW2FY(box,2));
-    tft.print (F("Grid:"));
+    tft.print ("Grid:");
     strcpy (f[NPF_GRID].str, grid);
     f[NPF_GRID].x = box.x + 1 + 6*NP_FONTW;
     f[NPF_GRID].r = 2;
@@ -298,16 +294,16 @@ static void initNPDialog (const SBox &box, NPField f[NPF_N], const LatLong &ll, 
     uint16_t x, y = ROW2FY(box,7);
     x = box.x + NP_FONTW;
     tft.setCursor (x, y);
-    tft.print (F("Delete"));
+    tft.print ("Delete");
     tft.drawRect (x-2, y-2, NP_FONTW*6+4, NP_FONTH+3, NP_TXCOLOR);
     x = box.x + box.w/2 - NP_FONTW;
     tft.setCursor (x, y);
-    tft.print (F("Ok"));
+    tft.print ("Ok");
     tft.drawRect (x-2, y-2, NP_FONTW*2+4, NP_FONTH+3, NP_TXCOLOR);
     x = box.x+box.w-7*NP_FONTW;
     tft.setCursor (x, y);
     tft.drawRect (x-2, y-2, NP_FONTW*6+4, NP_FONTH+3, NP_TXCOLOR);
-    tft.print (F("Cancel"));
+    tft.print ("Cancel");
 }
 
 /* check for a complete and consistent set of fields.
@@ -320,15 +316,15 @@ static bool allNPFieldsOK (const SBox &b, const NPField f[NPF_N], LatLong &ll, c
     bool ok = true;
 
     if (!maidenhead2ll (grid_ll, f[NPF_GRID].str)) {
-        showNPFieldError (b, f[NPF_GRID], strlen(f[NPF_GRID].str) > 0 ? _FX("Bad grid"):_FX("Missing grid"));
+        showNPFieldError (b, f[NPF_GRID], strlen(f[NPF_GRID].str) > 0 ? "Bad grid":"Missing grid");
         ok = false;
     }
     if (!latSpecIsValid(f[NPF_LAT].str, lt)) {
-        showNPFieldError (b, f[NPF_LAT], strlen(f[NPF_LAT].str) > 0 ? _FX("Bad lat") : _FX("Missing lat"));
+        showNPFieldError (b, f[NPF_LAT], strlen(f[NPF_LAT].str) > 0 ? "Bad lat" : "Missing lat");
         ok = false;
     }
     if (!lngSpecIsValid(f[NPF_LNG].str, lg)) {
-        showNPFieldError (b, f[NPF_LNG], strlen(f[NPF_LNG].str) > 0 ? _FX("Bad long") : _FX("Missing long"));
+        showNPFieldError (b, f[NPF_LNG], strlen(f[NPF_LNG].str) > 0 ? "Bad long" : "Missing long");
         ok = false;
     }
 
@@ -363,23 +359,35 @@ static int processNPTap (char kbc, NPFieldName focus_fn, const SBox &b, const SC
     // use kbc if given
     if (kbc != NPKB_NONE) {
         switch (kbc) {
-        case '\t':      // tab advances to next field
+        case CHAR_TAB:      // advance to next field downwards, or wrap
+        case CHAR_DOWN:
             switch (focus_fn) {
-            case NPF_LAT: return (NPKB_LNG);
-            case NPF_LNG: return (NPKB_GRID);
-            default:      return (NPKB_LAT);
+            case NPF_LAT:  return (NPKB_LNG);
+            case NPF_LNG:  return (NPKB_GRID);
+            case NPF_GRID: return (NPKB_LAT);
+            case NPF_N:    return (NPKB_NONE);
             }
             break;
-        case '\n':      // fallthru
-        case '\r':
+        case CHAR_UP:      // advance upwards or wrap
+            switch (focus_fn) {
+            case NPF_LAT:  return (NPKB_GRID);
+            case NPF_LNG:  return (NPKB_LAT);
+            case NPF_GRID: return (NPKB_LNG);
+            case NPF_N:    return (NPKB_NONE);
+            }
+            break;
+        case CHAR_NL:      // fallthru
+        case CHAR_CR:
             return (NPKB_OK);
-        case 27:        // esc
+        case CHAR_ESC:
             return (NPKB_CANCEL);
-        case '\b':      // fallthru
-        case 127:       // del
+        case CHAR_BS:      // fallthru
+        case CHAR_DEL:
             return (NPKB_DEL);
         default:
-            return (toupper(kbc));
+            if (isalnum(kbc))
+                return (toupper(kbc));
+            return (NPKB_NONE);
         }
     }
 
@@ -438,9 +446,16 @@ bool askNewPos (const SBox &b, LatLong &op_ll, char op_grid[MAID_CHARLEN])
     bool ok = false;
     bool cancelled = false;
     LatLong new_ll;
-    char new_grid[MAID_CHARLEN];
-    memset (&new_ll, 0, sizeof(new_ll));
-    memset (new_grid, 0, sizeof(new_grid));
+    char new_grid[MAID_CHARLEN] = "";
+    UserInput ui = {
+        b,
+        UI_UFuncNone,
+        UF_UNUSED,
+        NP_TIMEOUT,
+        UF_NOCLOCKS,
+        {0, 0}, TT_NONE, '\0', false, false
+    };
+
     do {
 
         // always fresh
@@ -450,25 +465,14 @@ bool askNewPos (const SBox &b, LatLong &op_ll, char op_grid[MAID_CHARLEN])
         // handy current field number
         NPFieldName focus_fn = (NPFieldName)(focus_fp - fields);
 
-        // read input touch or keyboard, cancel if time out
-        uint32_t t0 = millis();
-        TouchType tt;
-        SCoord s;
-        char kbc = 0;
-        while (!cancelled
-                        && ((tt = readCalTouchWS(s)) == TT_NONE || !inBox (s, b))
-                        && (kbc = tft.getChar()) == 0) {
-            if (timesUp (&t0, NP_TIMEOUT))
-                cancelled = true;
-            wdDelay(100);
-            tft.drawPR();
-        }
-        if (cancelled)
+        // wait for user to do something or time out
+        if (!waitForUser(ui) || ui.kb_char == CHAR_ESC || (ui.kb_char == CHAR_NONE && !inBox (ui.tap, b))) {
+            cancelled = true;
             continue;
+        }
 
-        // see whatever happened
-        int tap = processNPTap (kbc, focus_fn, b, s);
-        // Serial.printf (_FX("ask %d %c\n"), tap, isalnum(tap) ? tap : '*');
+        // see what happened
+        int tap = processNPTap (ui.kb_char, focus_fn, b, ui.tap);
 
         // update action
         switch (tap) {
@@ -512,7 +516,7 @@ bool askNewPos (const SBox &b, LatLong &op_ll, char op_grid[MAID_CHARLEN])
     // pass back if ok
     if (ok && !cancelled) {
         op_ll = new_ll;
-        normalizeLL (op_ll);
+        op_ll.normalize();
         strcpy (op_grid, new_grid);
         return (true);
     } else {

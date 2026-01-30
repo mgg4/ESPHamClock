@@ -1,91 +1,241 @@
-/* initial seed of radio control idea.
- * first attempt was simple bit-bang serial to kx3 to set frequency for a spot.
- * now we add hamlib's rigctld and w1hkj's flrig to rig they support without needing _SUPPORT_KX3.
+/* very basic radio control.
+ * support hamlib and flrig, plus legacy KX3 as a special case, from main thread.
+ * separate thread for all io polls PTT and sends new frequency.
  */
 
 
 #include "HamClock.h"
 
 
-/* setRigctldFreq helper to send the given command then read and discard response until find RPRT
- * N.B. we assume cmd already includes trailing \n
+// config
+#define RADIOPOLL_MS    1000                            // PTT polling period, ms
+#define RADIOLOOP_MS    250                             // overall thread polling period
+#define ERRDWELL_MS     3000                            // error message display time, ms
+#define WARN_MS         15000                           // reporting interval between repeating errs, ms
+#define RETRY_MS        2000                            // time to wait after connection fail, ms  
+
+
+// shared thread comm variables
+static volatile int set_hl_Hz, set_fl_Hz;               // set by main, reset to 0 when sent
+static volatile int thread_onair;                       // set by thread, main calls setOnAirSW if valid
+static char * volatile thread_msg;                      // malloced by thread, freed/zerod by main
+static pthread_mutex_t msg_lock = PTHREAD_MUTEX_INITIALIZER;    // guard thread_msg
+
+
+/* called by io thread to post a message to the main thread
  */
-static void sendHLCmd (WiFiClient &client, const char cmd[])
+static void postMsgToMain (const char *fmt, ...)
+{
+    // format
+    char buf[200];
+    va_list ap;
+    va_start (ap, fmt);
+    vsnprintf (buf, sizeof(buf), fmt, ap);
+    va_end (ap);
+
+    if (debugLevel (DEBUG_RIG, 1))
+        Serial.printf ("RADIO: posting %s\n", buf);
+
+    // inform main thread of new malloced message, discard are message not yet picked up.
+    if (pthread_mutex_lock (&msg_lock) == 0) {
+        if (thread_msg)
+            free (thread_msg);
+        thread_msg = strdup (buf);
+        if (!thread_msg)
+            fatalError ("No memory for radio message: %s", buf);
+        pthread_mutex_unlock (&msg_lock);
+    }
+}
+
+
+
+
+
+
+/**********************************************************************************
+ *
+ * hamlib
+ *
+ **********************************************************************************/
+
+/* set if rigctld was run with the --vfo arguement.
+ * determined using +\chk_vfo.
+ * when true most commands require an extra initial arg of "currVFO"
+ */
+static bool hamlib_vfo;
+
+/* Hamlib helper to send the given command then read and discard response until find RPRT.
+ * return whether io was ok.
+ */
+static bool sendHamlibCmd (WiFiClient &client, const char cmd[])
 {
     // send
-    Serial.printf ("RIG: %s", cmd);
-    client.print(cmd);
+    if (debugLevel (DEBUG_RIG, 2))
+        Serial.printf ("RADIO: HAMLIB: send: %s\n", cmd);
+    client.println(cmd);
 
-    // absorb reply until fine RPRT
+    // absorb reply until find RPRT
     char buf[64];
     bool ok = 0;
     do {
         ok = getTCPLine (client, buf, sizeof(buf), NULL);
-        if (ok)
-            Serial.printf ("  %s\n", buf);
+        if (ok) {
+            if (debugLevel (DEBUG_RIG, 2))
+                Serial.printf ("RADIO: HAMLIB reply: %s\n", buf);
+        } else {
+            Serial.printf ("RADIO: HAMLIB cmd %s: no reply\n", cmd);
+        }
     } while (ok && !strstr (buf, "RPRT"));
+
+    return (ok);
 }
 
-/* connect to rigctld and set the given frequency.
- * this can be used on all platforms.
+/* Hamlib helper to send the given command, look for given key word to collect reply, until find RPRT.
+ * return whether io ok regardless of reply value.
  */
-static void setRigctldFreq (float kHz)
+static bool intHamlibCmd (WiFiClient &client, const char cmd[], const char kw[], int &reply)
 {
-    // get host and port, bale if nothing
+    // send
+    if (debugLevel (DEBUG_RIG, 2))
+        Serial.printf ("RADIO: HAMLIB: send: %s\n", cmd);
+    client.println(cmd);
+
+    // absorb reply watching for keyword
+    size_t kw_l = strlen (kw);
+    char buf[64];
+    reply = -1;
+    bool ok = false;
+    do {
+        ok = getTCPLine (client, buf, sizeof(buf), NULL);
+        if (ok) {
+            if (strncmp (buf, kw, kw_l) == 0) {
+                reply = atoi (buf + kw_l);
+                if (reply < 0)
+                    Serial.printf ("RADIO: HAMLIB rejected %s -> %d\n", cmd, reply);
+                else if (debugLevel (DEBUG_RIG, 1))
+                    Serial.printf ("RADIO: HAMLIB %s -> %d\n", cmd, reply);
+            } else if (debugLevel (DEBUG_RIG, 2))
+                Serial.printf ("RADIO: HAMLIB reply: %s\n", buf);
+         } else {
+            Serial.printf ("RADIO: HAMLIB cmd %s: no reply\n", cmd);
+        }
+    } while (ok && (!strstr (buf, "RPRT") && !strstr (cmd, "chk_vfo"))); // chk_vfo does not reply RPRT
+
+    return (ok);
+}
+
+/* set the given freq via hamlib
+ */
+static bool setHamlibFreq (WiFiClient &client, int Hz)
+{
+    // send setup commands, require RPRT for each but ignore error values
+    static const char *setup_cmds[] = {         // without --vfo
+        "+\\set_split_vfo 0 VFOA",
+        "+\\set_vfo VFOA",
+        "+\\set_func RIT 0",
+        "+\\set_rit 0",
+        "+\\set_func XIT 0",
+        "+\\set_xit 0",
+    };
+    static const char *setup_cmds_vfo[] = {         // with --vfo
+        "+\\set_split_vfo currVFO 0 VFOA",
+        "+\\set_vfo VFOA",
+        "+\\set_func currVFO RIT 0",
+        "+\\set_rit currVFO 0",
+        "+\\set_func currVFO XIT 0",
+        "+\\set_xit currVFO 0",
+    };
+
+    bool ok = true;
+    if (hamlib_vfo)
+        for (int i = 0; ok && i < NARRAY(setup_cmds_vfo); i++)
+            ok = sendHamlibCmd (client, setup_cmds_vfo[i]);
+    else
+        for (int i = 0; ok && i < NARRAY(setup_cmds); i++)
+            ok = sendHamlibCmd (client, setup_cmds[i]);
+
+    // send freq if all still ok
+    if (ok) {
+        char cmd[128];
+        if (hamlib_vfo)
+            snprintf (cmd, sizeof(cmd), "+\\set_freq currVFO %d", Hz);
+        else
+            snprintf (cmd, sizeof(cmd), "+\\set_freq %d", Hz);
+        ok = sendHamlibCmd (client, cmd);
+    }
+
+    // ask for confirmation if still ok
+    if (ok) {
+        int reply = -1;
+        if (hamlib_vfo)
+            ok = intHamlibCmd (client, "+\\get_freq currVFO", "Frequency:", reply) && reply == Hz;
+        else
+            ok = intHamlibCmd (client, "+\\get_freq", "Frequency:", reply) && reply == Hz;
+        if (!ok)
+            Serial.printf ("RADIO: HAMLIB set %d Hz but acked %d\n", Hz, reply);
+    }
+
+    if (ok && debugLevel (DEBUG_RIG, 1))
+        Serial.printf ("RADIO: HAMLIB: set %d Hz\n", Hz);
+
+    return (ok);
+}
+
+
+
+/* connect to rigctld, return whether successful.
+ */
+static bool tryHamlibConnect (WiFiClient &client)
+{
+    // get host and port
     char host[NV_RIGHOST_LEN];
     int port;
     if (!getRigctld (host, &port))
-        return;
+        fatalError ("bug! tryHamlibConnect no getRigctld()");
 
     // connect, bale if can't
-    WiFiClient rig_client;
-    Serial.printf (_FX("RIG: %s:%d\n"), host, port);
-    if (!wifiOk() || !rig_client.connect(host, port)) {
-        Serial.printf (_FX("RIG: %s:%d failed\n"), host, port);
-        return;
+    if (!client.connect(host, port))
+        return (false);
+
+    if (debugLevel (DEBUG_RIG, 1))
+        Serial.printf ("RADIO: HAMLIB: %s:%d connect ok\n", host, port);
+
+    // check for --vfo
+    int reply = -1;
+    bool ok = intHamlibCmd (client, "+\\chk_vfo", "ChkVFO:", reply) && reply >= 0;
+    if (ok) {
+        hamlib_vfo = reply;
+        Serial.printf ("RADIO: HAMLIB was %sstarted with --vfo\n", hamlib_vfo ? "" : "not ");
     }
 
-    // stay alive
-    updateClocks(false);
-    resetWatchdog();
-
-    // send setup commands, require RPRT for each but ignore error values
-    #define _MAX_CMD_W 25
-    static const char setup_cmds[][_MAX_CMD_W] PROGMEM = {
-        "+\\set_split_vfo 0 VFOA\n",
-        "+\\set_vfo VFOA\n",
-        "+\\set_func RIT 0\n",
-        "+\\set_rit 0\n",
-        "+\\set_func XIT 0\n",
-        "+\\set_xit 0\n",
-    };
-    for (unsigned i = 0; i < NARRAY(setup_cmds); i++) {
-        char cmd[_MAX_CMD_W];
-        strcpy_P (cmd, setup_cmds[i]);
-        sendHLCmd (rig_client, cmd);
-    }
-
-    // send freq
-    char fcmd[32];
-    snprintf (fcmd, sizeof(fcmd), "+\\set_freq %d\n", (int)(kHz*1000));
-    sendHLCmd (rig_client, fcmd);
-
-    // finished
-    rig_client.stop();
+    // ok?
+    return (ok);
 }
 
-/* setFlrigFreq helper to send and xml-rpc command and discard response
+
+
+
+/**********************************************************************************
+ *
+ * flrig
+ *
+ **********************************************************************************/
+
+/* send an flrig xml-rpc command.
+ * N.B. caller must still handle reply after return.
  */
-static void sendXMLRPCCmd (WiFiClient &client, const char cmd[], const char value[], const char type[])
+static void coreFlrigCmd (WiFiClient &client, const char cmd[], const char value[], const char type[])
 {
-    static const char hdr_fmt[] PROGMEM =
+    // printf-style format template for HTML header
+    static const char hdr_fmt[] =
         "POST /RPC2 HTTP/1.1\r\n"
         "Content-Type: text/xml\r\n"
         "Content-length: %d\r\n"
         "\r\n"
-        "%s"
     ;
-    static const char body_fmt[] PROGMEM =
+
+    // printf-style format template for XML contents
+    static const char body_fmt[] =
         "<?xml version=\"1.0\" encoding=\"us-ascii\"?>\r\n"
         "<methodCall>\r\n"
         "    <methodName>%.50s</methodName>\r\n"
@@ -95,182 +245,130 @@ static void sendXMLRPCCmd (WiFiClient &client, const char cmd[], const char valu
         "</methodCall>\r\n"
     ;
 
-    // copy each to mem
-    StackMalloc hdr_fmt_mem(sizeof(hdr_fmt));
-    strcpy_P (hdr_fmt_mem.getMem(), hdr_fmt);
-    StackMalloc body_fmt_mem(sizeof(body_fmt));
-    strcpy_P (body_fmt_mem.getMem(), body_fmt);
+    // create body text first to get length
+    char xml_body[sizeof(body_fmt) + 100];
+    int body_l = snprintf (xml_body, sizeof(xml_body), body_fmt, cmd, type, value, type);
 
-    // format body
-    #define _BODY_SIZ (sizeof(body_fmt)+150)       // guard with %.Xs in body_fmt[]
-    StackMalloc body_mem(_BODY_SIZ);
-    char *body_buf = body_mem.getMem();
-    int body_l = snprintf (body_buf, _BODY_SIZ, body_fmt_mem.getMem(), cmd, type, value, type);
+    // create header text including length of body text
+    char xml_hdr[sizeof(hdr_fmt) + 100];
+    snprintf (xml_hdr, sizeof(xml_hdr), hdr_fmt, body_l);
 
-    // format complete message
-    #define _MSG_SIZ (sizeof(hdr_fmt)+20+body_l)
-    StackMalloc msg_mem(_MSG_SIZ);
-    char *msg_buf = msg_mem.getMem();
-    snprintf (msg_buf, _MSG_SIZ, hdr_fmt_mem.getMem(), body_l, body_buf);
+    if (debugLevel (DEBUG_RIG, 2)) {
+        Serial.printf ("RADIO: FLRIG: sending:\n");
+        printf ("%s", xml_hdr);
+        printf ("%s", xml_body);
 
-    // send
-    Serial.printf (_FX("FLRIG: %s %s %s\n"), cmd, value, type);
-    client.print(msg_buf);
+    } 
 
-    // absorb reply until </methodResponse>
-    bool ok = 0;
-    do {
-        ok = getTCPLine (client, msg_buf, _MSG_SIZ, NULL);
-        if (ok)
-            Serial.printf ("  %s\n", msg_buf);
-    } while (ok && !strstr (msg_buf, _FX("</methodResponse>")));
+    // send hdr then body
+    client.print(xml_hdr);
+    client.print(xml_body);
 }
 
-/* connect to flrig and set the given frequency.
- * this can be used on all platforms.
+/* helper to send a flrig xml-rpc command and discard response
  */
-static void setFlrigFreq (float kHz)
+static bool sendFlrigCmd (WiFiClient &client, const char cmd[], const char value[], const char type[])
+{
+    // send core command
+    coreFlrigCmd (client, cmd, value, type);
+
+    // skip through reply until </methodResponse>
+    if (debugLevel (DEBUG_RIG, 2))
+        Serial.printf ("RADIO: FLRIG: reply:\n");
+    char reply_buf[200];
+    bool ok = false;
+    do {
+        ok = getTCPLine (client, reply_buf, sizeof(reply_buf), NULL);
+        if (ok) {
+            if (debugLevel (DEBUG_RIG, 2))
+                printf ("%s\n", reply_buf);
+        } else {
+            Serial.printf ("RADIO: FLRIG cmd %s: no reply\n", cmd);
+        }
+    } while (ok && !strstr (reply_buf, "</methodResponse>"));
+
+    return (ok);
+}
+
+/* helper to send a flrig xml-rpc command and report integer reply.
+ * reply whether io ok independent of reply value.
+ */
+static bool intFlrigCmd (WiFiClient &client, const char cmd[], const char value[], const char type[],
+int &reply)
+{
+    // send core command
+    coreFlrigCmd (client, cmd, value, type);
+
+    // skip through response until find </methodResponse>, watch for <value> reply along the way
+    if (debugLevel (DEBUG_RIG, 2))
+        Serial.printf ("RADIO: FLRIG: reply:\n");
+    char reply_buf[200];
+    reply = -1;
+    bool ok = false;
+    do {
+        ok = getTCPLine (client, reply_buf, sizeof(reply_buf), NULL);
+        if (ok) {
+            if (debugLevel (DEBUG_RIG, 2))
+                printf ("%s\n", reply_buf);
+            if (sscanf (reply_buf, " <value><i4>%d", &reply) == 1
+                                        || sscanf (reply_buf, " <value>%d", &reply) == 1) {
+                if (reply < 0)
+                    Serial.printf ("RADIO: FLRIG: cmd %s reply %d\n", cmd, reply);
+            }
+        } else {
+            Serial.printf ("RADIO: FLRIG cmd %s: no reply\n", cmd);
+        }
+    } while (ok && !strstr (reply_buf, "</methodResponse>"));
+
+    return (ok);
+}
+
+/* set the given freq via flrig
+ */
+static bool setFlrigFreq (WiFiClient &client, int Hz)
+{
+    int reply;
+    char Hzstr[20];
+    snprintf (Hzstr, sizeof(Hzstr), "%d", Hz);
+    return (sendFlrigCmd (client, "rig.set_split", "0", "int")
+                        && sendFlrigCmd (client, "rig.set_vfoA", Hzstr, "double")
+                        && intFlrigCmd (client, "rig.get_vfoA", "0", "int", reply)
+                        && reply == Hz);
+
+}
+
+/* connect to flig, return whether successful.
+ * N.B. we assume getFlrig will be true.
+ */
+static bool tryFlrigConnect (WiFiClient &client)
 {
     // get host and port, bale if nothing
     char host[NV_FLRIGHOST_LEN];
     int port;
     if (!getFlrig (host, &port))
-        return;
+        fatalError ("tryFlrigConnect no control");
 
     // connect, bale if can't
-    WiFiClient flrig_client;
-    Serial.printf (_FX("FLRIG: %s:%d\n"), host, port);
-    if (!wifiOk() || !flrig_client.connect(host, port)) {
-        Serial.printf (_FX("FLRIG: %s:%d failed\n"), host, port);
-        return;
-    }
+    if (!client.connect(host, port))
+        return (false);
 
-    // send commands
-    char value[20];
-    snprintf (value, sizeof(value), "%.0f", kHz*1000);
-    sendXMLRPCCmd (flrig_client, _FX("rig.set_split"), "0", "int");
-    sendXMLRPCCmd (flrig_client, _FX("rig.set_vfoA"), value, "double");
+    if (debugLevel (DEBUG_RIG, 1))
+        Serial.printf ("RADIO: FLRIG: %s:%d connect ok\n", host, port);
 
-    // finished
-    flrig_client.stop();
+    // ok
+    return (true);
 }
+
+
 
 
 #if defined(_SUPPORT_KX3)
 
-/* cleanup commands before changing freq:
- *
- *   SB0 = Set Sub Receiver or Dual Watch off
- *   FR0 = Cancel Split on K2, set RX vfo A
- *   FT0 = Set tx vfo A
- *   RT0 = Set RIT off
- *   XT0 = Set XIT off
- *   RC  = Set RIT / XIT to zero
- */
-static char cleanup_cmds[] = ";SB0;FR0;FT0;RT0;XT0;RC;";
-
-/* sprintf format to set new frequency, requires float in Hz
- */
-static char setfreq_fmt[] = ";FA%011.0f;";
-
-
-#if defined(_GPIO_ESP)
-
-
 /**********************************************************************************
  *
+ * kx3
  *
- *  send spot frequency to Elecraft radio on Huzzah pin 15.
- *
- *
- **********************************************************************************
- */
- 
-
-
-
-
-/* send one bit @ getKX3Baud().
- * N.B. they want mark/sense inverted
- */
-static void sendOneBit (uint8_t hi)
-{
-    uint32_t t0 = ESP.getCycleCount();
-    digitalWrite (Elecraft_GPIO, !hi);
-    uint32_t bit_time = ESP.getCpuFreqMHz()*1000000UL/getKX3Baud();
-    while (ESP.getCycleCount()-t0 < bit_time)
-        continue;
-}
-
-/* perform one-time preparation for sending commands
- */
-static void prepIO()
-{
-    pinMode(Elecraft_GPIO, OUTPUT);
-    sendOneBit (1);
-}
-
-/* send the given command.
- */
-static void sendOneMessage (const char cmd[])
-{
-    Serial.printf (_FX("Elecraft: %s\n"), cmd);
-
-    // send each char, 8N1, MSByte first
-    char c;
-    while ((c = *cmd++) != '\0') {
-
-        // disable interrupts for a clean transmit
-        cli();
-
-        sendOneBit (0);                                 // start bit
-        for (uint8_t bit = 0; bit < 8; bit++) {         // LSBit first
-            sendOneBit (c & 1);
-            c >>= 1;
-        }
-        sendOneBit (1);                                 // stop bit
-
-        // resume interrupts
-        sei();
-    }
-}
-
-
-
-
-/* command radio to the given frequency.
- */
-void setRadioSpot (float kHz)
-{
-    // always try rigctld and flrig
-    setRigctldFreq (kHz);
-    setFlrigFreq (kHz);
-
-    // ignore if not to use GPIO or baud 0
-    if (!GPIOOk() || getKX3Baud() == 0)
-        return;
-
-    resetWatchdog();
-
-    // one-time IO setup
-    static bool ready;
-    if (!ready) {
-        prepIO();
-        ready = true;
-        Serial.println (F("Elecraft: ready"));
-    }
-
-    // send cleanup commands
-    sendOneMessage (cleanup_cmds);
-
-    // format and send command to change frequency
-    char buf[30];
-    (void) sprintf (buf, setfreq_fmt, kHz*1e3);
-    sendOneMessage (buf);
-}
-
-#elif defined(_SUPPORT_GPIO)
-
+ **********************************************************************************/
 
 
 
@@ -282,26 +380,27 @@ void setRadioSpot (float kHz)
  * timing will not be very good.
  *
  *
- **********************************************************************************
- */
+ **********************************************************************************/
  
 
-
-
 #include <time.h>
-#include "GPIO.h"
 
-/* return our gpio pins to quiescent state
+
+/* setup commands before changing freq:
+ *
+ *   SB0 = Set Sub Receiver or Dual Watch off
+ *   FR0 = Cancel Split on K2, set RX vfo A
+ *   FT0 = Set tx vfo A
+ *   RT0 = Set RIT off
+ *   XT0 = Set XIT off
+ *   RC  = Set RIT / XIT to zero
  */
-void radioResetIO()
-{
-    if (!GPIOOk())
-        return;
-    GPIO& gpio = GPIO::getGPIO();
-    if (!gpio.isReady())
-        return;
-    gpio.setAsInput(Elecraft_GPIO);
-}
+static const char KX3setup_cmds[] = ";SB0;FR0;FT0;RT0;XT0;RC;";
+
+/* snprintf format to set new frequency, requires float in Hz
+ */
+static const char KX3setfreq_fmt[] = ";FA%011.0f;";
+
 
 /* send one bit @ getKX3Baud(), bit time multiplied by correction factor.
  * N.B. they want mark/sense inverted
@@ -310,19 +409,18 @@ void radioResetIO()
  *      man pthread_setaffinity_np
  *      https://www.kernel.org/doc/html/v4.10/admin-guide/kernel-parameters.html
  */
-static void sendOneBit (int hi, float correction)
+static void KX3sendOneBit (int hi, float correction)
 {
     // get time now
     struct timespec t0, t1;
     clock_gettime (CLOCK_MONOTONIC, &t0);
 
     // set bit (remember: Elecraft wants inverted mark/sense)
-    GPIO& gpio = GPIO::getGPIO();
-    gpio.setHiLo (Elecraft_GPIO, !hi);
+    mcp.digitalWrite (MCP_FAKE_KX3, !hi);
 
     // wait for one bit duration with modified correction including nominal correction
     uint32_t baud = getKX3Baud();
-    float overhead = 1.0F - 0.08F*baud/38400;          // measured on pi 4
+    float overhead = 1.0F - 0.04F*baud/38400;          // measured on pi 4
     unsigned long bit_ns = 1000000000UL/baud*overhead*correction;
     unsigned long dt_ns;
     do {
@@ -331,21 +429,11 @@ static void sendOneBit (int hi, float correction)
     } while (dt_ns < bit_ns);
 }
 
-/* perform one-time preparation for sending commands
- */
-static void prepIO()
-{
-    // init Elecraft pin
-    GPIO& gpio = GPIO::getGPIO();
-    gpio.setAsOutput(Elecraft_GPIO);
-    sendOneBit (1, 1.0F);
-}
-
 
 /* send the given string with the given time correction factor.
  * return total nsecs.
  */
-static uint32_t sendOneString (float correction, const char str[])
+static uint32_t KX3sendOneString (float correction, const char str[])
 {
     // get current scheduler and priority
     int orig_sched = sched_getscheduler(0);
@@ -357,7 +445,7 @@ static uint32_t sendOneString (float correction, const char str[])
     hi_param.sched_priority = sched_get_priority_max(SCHED_FIFO);
     bool hipri_ok = sched_setscheduler (0, SCHED_FIFO, &hi_param) == 0;
     if (!hipri_ok)
-        printf (_FX("Failed to set new prioity %d: %s\n"), hi_param.sched_priority, strerror(errno));
+        Serial.printf ("RADIO: KX3: sched_setscheduler(%d): %s\n", hi_param.sched_priority, strerror(errno));
 
     // get starting time
     struct timespec t0, t1;
@@ -366,12 +454,12 @@ static uint32_t sendOneString (float correction, const char str[])
     // send each char, 8N1, MSByte first
     char c;
     while ((c = *str++) != '\0') {
-        sendOneBit (0, correction);                         // start bit
-        for (uint8_t bit = 0; bit < 8; bit++) {             // LSBit first
-            sendOneBit (c & 1, correction);                 // data bit
+        KX3sendOneBit (0, correction);                  // start bit
+        for (uint8_t bit = 0; bit < 8; bit++) {         // LSBit first
+            KX3sendOneBit (c & 1, correction);          // data bit
             c >>= 1;
         }
-        sendOneBit (1, correction);                         // stop bit
+        KX3sendOneBit (1, correction);                     // stop bit
     }
 
     // record finish time
@@ -387,17 +475,17 @@ static uint32_t sendOneString (float correction, const char str[])
 
 /* send the given command.
  */
-static void sendOneMessage (const char cmd[])
+static void KX3sendOneMessage (const char cmd[])
 {
     // len
     size_t cmd_l = strlen(cmd);
 
     // compute ideal time to send command
-    uint32_t bit_ns = 1000000000UL/getKX3Baud();           // ns per bit
-    uint32_t cmd_ns = cmd_l*10*bit_ns;                     // start + 8N1
+    uint32_t bit_ns = 1000000000UL/getKX3Baud();        // ns per bit
+    uint32_t cmd_ns = cmd_l*10*bit_ns;                  // start + 8N1
   
     // send with no speed correction
-    uint32_t ns0 = sendOneString (1.0F, cmd);
+    uint32_t ns0 = KX3sendOneString (1.0F, cmd);
 
     // compute measured correction factor
     float correction = (float)cmd_ns/ns0;
@@ -406,57 +494,249 @@ static void sendOneMessage (const char cmd[])
     uint32_t ns1 = 0;
     if (correction < 0.99F || correction > 1.01F) {
         usleep (500000);    // don't pummel
-        ns1 = sendOneString (correction, cmd);
+        ns1 = KX3sendOneString (correction, cmd);
     }
 
-    printf (_FX("Elecraft: correction= %g cmd= %u ns0= %u ns1= %u ns\n"), correction, cmd_ns, ns0, ns1);
+    Serial.printf ("RADIO: KX3: correction= %g cmd= %u ns0= %u ns1= %u ns\n", correction, cmd_ns, ns0, ns1);
 
 }
 
-
-/* command radio to the given frequency.
+/* perform one-time preparation for sending commands
  */
-void setRadioSpot (float kHz)
+static void KX3prepIO()
 {
-    // always try rigctld and flrig
-    setRigctldFreq (kHz);
-    setFlrigFreq (kHz);
+    // init Elecraft pin
+    mcp.pinMode (MCP_FAKE_KX3, OUTPUT);
+    KX3sendOneBit (1, 1.0F);
+}
 
-    // ignore if not to use GPIO or baud 0
+/* return our gpio pins to quiescent state
+ */
+static void KX3radioResetIO()
+{
+    mcp.pinMode (MCP_FAKE_KX3, INPUT);
+}
+
+/* command KX3 frequency
+ */
+static void setKX3Spot (float kHz)
+{
+    // even if have proper io still ignore if not supposed to use GPIO or baud is 0
     if (!GPIOOk() || getKX3Baud() == 0)
         return;
 
     // one-time IO setup
-    resetWatchdog();
     static bool ready;
     if (!ready) {
-        prepIO();
+        KX3prepIO();
         ready = true;
-        Serial.println (F("Elecraft: ready"));
+        Serial.println ("RADIO: KX3: ready");
     }
 
-    // send cleanup commands
-    sendOneMessage (cleanup_cmds);
+    // send setup commands
+    KX3sendOneMessage (KX3setup_cmds);
 
     // format and send command to change frequency
     char buf[30];
-    (void) sprintf (buf, setfreq_fmt, kHz*1e3);
-    sendOneMessage (buf);
+    (void) snprintf (buf, sizeof(buf), KX3setfreq_fmt, kHz*1e3);
+    KX3sendOneMessage (buf);
 }
 
-#endif // _SUPPORT_GPIO
 
-#else  // !_SUPPORT_KX3
+#endif  // _SUPPORT_KX3
 
 
-/* same for system without any gpio
+
+
+
+/******************************************************************************
+ *
+ * io thread
+ *
+ ******************************************************************************/
+
+/* perpetual thread to establish and maintain contact with rig control server(s).
+ * communicate with main thread via a few shared variables.
+ * N.B. not used for KX3.
+ */
+static void *radioThread (void *unused)
+{
+    (void) unused;
+
+    // forever
+    pthread_detach(pthread_self());
+
+    WiFiClient hl_client, fl_client;
+    uint32_t hlpoll_ms = 0, hlwarn_ms = 0;
+    uint32_t flpoll_ms = 0, flwarn_ms = 0;
+
+    while (true) {
+
+        if (getRigctld (NULL, NULL)) {
+
+            // insure connected
+            if (!hl_client.connected()) {
+                if (tryHamlibConnect (hl_client))
+                    postMsgToMain ("HAMLIB connection successful");
+                else {
+                    if (timesUp (&hlwarn_ms, WARN_MS))
+                        postMsgToMain ("HAMLIB no connection");
+                    usleep (RETRY_MS*1000);
+                }
+            }
+
+            // check for setting new frequency -- set by human clicking a spot so post all errors
+            if (set_hl_Hz) {
+                if (hl_client.connected()) {
+                    if (!setHamlibFreq (hl_client, set_hl_Hz))
+                        postMsgToMain ("HAMLIB failed to verify %d Hz", set_hl_Hz);
+                    else
+                        Serial.printf ("RADIO HAMLIB set %d Hz\n", set_hl_Hz);
+                } else 
+                    postMsgToMain ("HAMLIB not connected to set %d Hz", set_hl_Hz);
+
+                // ack this attempt to set freq
+                set_hl_Hz = 0;
+            }
+
+            // continuous automatic poll PTT every RADIOPOLL_MS -- only post errors every WARN_MS
+            if (timesUp (&hlpoll_ms, RADIOPOLL_MS) && hl_client.connected()) {
+                int reply = -1;
+                if (hamlib_vfo) {
+                    if (intHamlibCmd (hl_client, "+\\get_ptt currVFO", "PTT:", reply) && reply >= 0)
+                        thread_onair = reply;
+                } else {
+                    if (intHamlibCmd (hl_client, "+\\get_ptt", "PTT:", reply) && reply >= 0)
+                        thread_onair = reply;
+                }
+                if (reply < 0 && timesUp (&hlwarn_ms, WARN_MS)) {
+                    postMsgToMain ("HAMLIB PTT query failed");
+                    thread_onair = 0;
+                }
+            }
+        }
+
+        if (getFlrig (NULL, NULL)) {
+
+            // insure connected
+            if (!fl_client.connected()) {
+                if (tryFlrigConnect (fl_client))
+                    postMsgToMain ("FLRIG connection successful");
+                else {
+                    if (timesUp (&flwarn_ms, WARN_MS))
+                        postMsgToMain ("FLRIG no connection");
+                    usleep (RETRY_MS*1000);
+                }
+            }
+
+            // check for setting new frequency -- set by human clicking a spot so post all errors
+            if (set_fl_Hz) {
+                if (fl_client.connected()) {
+                    if (!setFlrigFreq (fl_client, set_fl_Hz))
+                        postMsgToMain ("FLRIG failed to verify %d Hz", set_fl_Hz);
+                    else
+                        Serial.printf ("RADIO FLRIG set %d Hz\n", set_hl_Hz);
+                } else 
+                    postMsgToMain ("FLRIG not connected to set %d Hz", set_fl_Hz);
+
+                // ack this attempt to set freq
+                set_fl_Hz = 0;
+            }
+
+            // continuous automatic poll PTT every RADIOPOLL_MS -- only post errors every WARN_MS
+            if (timesUp (&flpoll_ms, RADIOPOLL_MS) && fl_client.connected()) {
+                int reply = -1;
+                if (intFlrigCmd (fl_client, "rig.get_ptt", "0", "int", reply) && reply >= 0)
+                    thread_onair = reply;
+                else if (timesUp (&flwarn_ms, WARN_MS)) {
+                    postMsgToMain ("FLRIG PTT query failed");
+                    thread_onair = 0;
+                }
+            }
+        }
+
+        delay (RADIOLOOP_MS);
+    }
+
+    fatalError ("radioThread failure");
+    return (NULL);
+}
+
+
+/* insure radioThread is running, harmless if called repeatedly, fatal if thread creation fails.
+ * return whether ok to proceed with rig io.
+ */
+static bool startRadioThread (void)
+{
+    if (!getFlrig(NULL,NULL) && !getRigctld(NULL,NULL))
+        return (false);
+
+    // start first time
+    static bool thread_running;
+    if (!thread_running) {
+        pthread_t tid;
+        int e = pthread_create (&tid, NULL, radioThread, NULL);
+        if (e)
+            fatalError ("radioThread failed: %s", strerror(e));
+        thread_running = true;
+    }
+    return (thread_running);
+}
+
+
+
+/******************************************************************************
+ *
+ * public interface
+ *
+ ******************************************************************************/
+
+
+/* try setting freq to all desired radios.
  */
 void setRadioSpot (float kHz)
 {
-    // always try rigctld and flrig
-    setRigctldFreq (kHz);
-    setFlrigFreq (kHz);
-}
-
+#if defined(_SUPPORT_KX3)
+    // setting kx3 does not require the control thread
+    if (setRadio())
+        setKX3Spot (kHz);
 #endif // _SUPPORT_KX3
 
+    // insure thread running or bale if not needed
+    if (!startRadioThread())
+        return;
+
+    // inform thread if desired
+    if (setRadio())
+        set_fl_Hz = set_hl_Hz = (int) (kHz * 1000);
+}
+
+/* leisurely poll radio for state
+ */
+void pollRadio(void)
+{
+    // insure thread running or bale if not needed
+    if (!startRadioThread())
+        return;
+
+    // show any pending messages
+    if (pthread_mutex_lock (&msg_lock) == 0) {
+        if (thread_msg) {
+            mapMsg (ERRDWELL_MS, "%s", thread_msg);
+            free (thread_msg);
+            thread_msg = NULL;
+        }
+        pthread_mutex_unlock (&msg_lock);
+    }
+
+    // show current state of ptt
+    setOnAirSW (thread_onair);
+}
+
+void radioResetIO(void)
+{
+#if defined(_SUPPORT_KX3)
+    if (GPIOOk())
+        KX3radioResetIO();
+#endif // _SUPPORT_KX3
+}

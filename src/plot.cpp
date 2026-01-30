@@ -4,15 +4,12 @@
 #include "HamClock.h"
 
 #define BORDER_COLOR    GRAY
+#define GRID_COLOR      RGB565(55,55,55)
 #define TICKLEN         2                       // length of plot tickmarks, pixels
 #define TGAP            10                      // top gap for title
 #define BGAP            15                      // bottom gap for x labels
-#define FONTW           6                       // font width with gap
-#define FONTH           8                       // font height
-
-
-// forward declarations
-static int tickmarks (float min, float max, int numdiv, float ticks[]);
+#define FONTW           6                       // fast font width
+#define FONTH           8                       // fast font height
 
 
 /* plot the given data within the given box.
@@ -20,7 +17,7 @@ static int tickmarks (float min, float max, int numdiv, float ticks[]);
  * if y_min < y_max:  force min to y_min and max to y_max
  * if y_min > y_max:  force min to y_min but auto scale max from data
  * return whether had anything to plot.
- * N.B. if both labels are NULL, use same labels and limits as previous call as an "overlay"
+ * N.B. if both [xy]labels are NULL, use same limits as previous call as an "overlay"
  * N.B. special y axis labeling hack when ylabel contains the string "Ray"
  * N.B. special plot format hack when ylabel contains "Kp"
  */
@@ -28,7 +25,7 @@ bool plotXY (const SBox &box, float x[], float y[], int nxy, const char *xlabel,
 uint16_t color, float y_min, float y_max, float label_value)
 {
     char buf[32];
-    sprintf (buf, "%.*f", label_value >= 1000 ? 0 : 1, label_value);
+    snprintf (buf, sizeof(buf), "%.*f", fabsf(label_value) >= 100 ? 0 : 1, label_value);
     return (plotXYstr (box, x, y, nxy, xlabel, ylabel, color, y_min, y_max, buf));
 }
 
@@ -37,8 +34,6 @@ uint16_t color, float y_min, float y_max, float label_value)
 bool plotXYstr (const SBox &box, float x[], float y[], int nxy, const char *xlabel, const char *ylabel,
 uint16_t color, float y_min, float y_max, char *label_str)
 {
-    resetWatchdog();
-
     // no labels implies overlay previous plot
     bool overlay = xlabel == NULL && ylabel == NULL;
 
@@ -111,7 +106,7 @@ uint16_t color, float y_min, float y_max, char *label_str)
         // find minimal LGAP that accommodates widest y label
         LGAP = 0;
         for (int i = 0; i < nyt; i++) {
-            sprintf (buf, "%.0f", yticks[i]);   // N.B. use same format as label 
+            snprintf (buf, sizeof(buf), "%.0f", yticks[i]);   // N.B. use same format as label 
             uint16_t g = getTextWidth(buf) + TICKLEN + 5;
             if (g > LGAP)
                 LGAP = g;
@@ -133,14 +128,10 @@ uint16_t color, float y_min, float y_max, char *label_str)
             // mark exponents and customary X ray levels, extend levels across in darker color
             uint16_t tx = box.x+2*FONTW+TICKLEN+5;
             uint16_t step_h = (box.h-BGAP-TGAP)/nyt;
-            uint8_t h, s, v, r, g, b;
-            rgbtohsv (&h, &s, &v, RGB565_R(color), RGB565_G(color), RGB565_B(color)); 
-            hsvtorgb (&r, &g, &b, h, s, v/5);
-            uint16_t bk_col = RGB565(r,g,b);
             for (int i = 0; i < nyt; i++) {
                 uint16_t ty = (uint16_t)(box.y + TGAP + (box.h-BGAP-TGAP)*(1 - (yticks[i]-miny)/dy) + 0.5F);
                 tft.drawLine (tx-TICKLEN, ty, tx, ty, color);           // main tick
-                tft.drawLine (tx, ty, box.x+box.w-1, ty, bk_col);       // level line across
+                tft.drawLine (tx, ty, box.x+box.w-1, ty, GRID_COLOR);   // level line across
                 tft.setCursor (tx-FONTW-1, ty-step_h+(step_h-FONTH)/2-1);
                 switch ((int)yticks[i]) {
                 case -9: tft.setCursor (tx-TICKLEN-2*FONTW-1, ty-FONTH/2); tft.print(-9); break;
@@ -158,10 +149,11 @@ uint16_t color, float y_min, float y_max, char *label_str)
             for (int i = 0; i < nyt; i++) {
                 uint16_t ty = (uint16_t)(box.y + TGAP + (box.h-BGAP-TGAP)*(1 - (yticks[i]-miny)/dy) + 0.5F);
                 tft.drawLine (tx, ty, tx+TICKLEN, ty, color);
+                tft.drawLine (box.x+LGAP, ty, box.x+box.w-1, ty, GRID_COLOR);
                 // label first, last or whole number change but never two adjacent or just before last
                 if (i == 0 || i == nyt-1 || (!prev_tick && (int)yticks[i-1] != (int)yticks[i] && i != nyt-2)){
-                    sprintf (buf, "%.0f", yticks[i]);
-                    tft.setCursor (tx - getTextWidth(buf) - 1, ty - FONTH/2);
+                    snprintf (buf, sizeof(buf), "%.0f", yticks[i]);
+                    tft.setCursor (tx - getTextWidth(buf) - 1, ty - FONTH/2 + 1);
                     tft.print (buf);
                     prev_tick = true;
                 } else
@@ -169,21 +161,25 @@ uint16_t color, float y_min, float y_max, char *label_str)
             }
         }
 
-        // y label is title over plot
+        // y label is title over plot, beware spilling off right edge
         uint16_t tl = getTextWidth(ylabel);
-        tft.setCursor (box.x+LGAP+(box.w-LGAP-tl)/2, box.y+(TGAP-FONTH)/2);
+        uint16_t ttx = box.x + LGAP + (box.w-LGAP-tl)/2;
+        if (ttx + tl >= box.x + box.w)
+            ttx = box.x + box.w - tl;
+        tft.setCursor (ttx, box.y+(TGAP-FONTH)/2+1);
         tft.print (ylabel);
 
         // x labels and tickmarks just below plot
         uint16_t txty = box.y+box.h-FONTH-2;
         tft.setCursor (box.x+LGAP, txty);
         tft.print (minx,0);
-        sprintf (buf, "%c%d", maxx > 0 ? '+' : ' ', (int)maxx);
+        snprintf (buf, sizeof(buf), "%c%d", maxx > 0 ? '+' : ' ', (int)maxx);
         tft.setCursor (box.x+box.w-getTextWidth(buf)-1, txty);
         tft.print (buf);
         for (int i = 0; i < nxt; i++) {
             uint16_t tx = (uint16_t)(box.x+LGAP + (box.w-LGAP-1)*(xticks[i]-minx)/dx + 0.5F);
             tft.drawLine (tx, box.y+box.h-BGAP, tx, box.y+box.h-BGAP+TICKLEN, color);
+            tft.drawLine (tx, box.y+box.h-BGAP, tx, box.y+TGAP, GRID_COLOR);
         }
 
         // always label 0 if within larger range
@@ -199,38 +195,49 @@ uint16_t color, float y_min, float y_max, char *label_str)
 
     }
 
-    uint16_t last_px = 0, last_py = 0;
-    resetWatchdog();
+    // finally the data
+    uint16_t prev_px = 0, prev_py = 0;
+    bool prev_lacuna = false;           // avoid adjacent lacunas, eg, env plots
+    const float lacuna_dx = 5*dx/nxy;   // define as a gap at least 5x average spacing
     for (int i = 0; i < nxy; i++) {
         // Serial.printf ("kp %2d: %g %g\n", i, x[i], y[i]);
         if (kp_plot) {
             // plot Kp values vertical bars colored depending on strength
-            uint16_t w = (box.w-LGAP-2)/nxy;
             uint16_t h = y[i]*(box.h-BGAP-TGAP)/maxy;
-            uint16_t px = (uint16_t)(box.x+LGAP+1 + (box.w-LGAP-2-w)*(x[i]-minx)/dx);
-            uint16_t py = (uint16_t)(box.y + TGAP + 1 + (box.h-BGAP-TGAP)*(1 - (y[i]-miny)/dy));
-            uint16_t co = y[i] < 4 ? RA8875_GREEN : y[i] == 4 ? RA8875_YELLOW : RA8875_RED;
-            if (h > 0)
+            if (h > 0) {
+                uint16_t w = (box.w-LGAP-2)/nxy;
+                uint16_t px = (uint16_t)(box.x+LGAP+1 + (box.w-LGAP-2-w)*(x[i]-minx)/dx);
+                uint16_t py = (uint16_t)(box.y + TGAP + 1 + (box.h-BGAP-TGAP)*(1 - (y[i]-miny)/dy));
+                uint16_t co = y[i] < 4.5 ? RGB565(0x91,0xd0,0x51) : 
+                              y[i] < 5.5 ? RGB565(0xf6,0xeb,0x16) :
+                              y[i] < 6.5 ? RGB565(0xfe,0xc8,0x04) :
+                              y[i] < 7.5 ? RGB565(0xff,0x96,0x02) :
+                              y[i] < 8.5 ? RGB565(0xff,0x00,0x00) :
+                                           RGB565(0xc7,0x01,0x00);
                 tft.fillRect (px, py, w, h, co);
+            }
         } else {
-            // other plots are connect-the-dots
+            // other plots are connect-the-dots but watch for lacuna
             uint16_t px = (uint16_t)(box.x+LGAP+1 + (box.w-LGAP-3)*(x[i]-minx)/dx);   // stay inside border
             uint16_t py = (uint16_t)(box.y + TGAP + (box.h-BGAP-TGAP)*(1 - (y[i]-miny)/dy));
-            if (i > 0 && (last_px != px || last_py != py))
-                tft.drawLine (last_px, last_py, px, py, color);            // avoid bug with 0-length lines
-            else if (nxy == 1)
+            if (nxy == 1) {
                 tft.drawLine (box.x+LGAP, py, box.x+box.w-1, py, color);   // one value clear across
-            last_px = px;
-            last_py = py;
+            } else if (i > 0) {
+                bool is_lacuna = (x[i]-x[i-1]) > lacuna_dx;
+                if ((prev_px != px || prev_py != py) && (!is_lacuna || !prev_lacuna))
+                    tft.drawLine (prev_px, prev_py, px, py, color);        // avoid bug with 0-length lines
+                prev_lacuna = is_lacuna;
+            }
+            prev_px = px;
+            prev_py = py;
         }
     }
 
     // draw plot border
     tft.drawRect (box.x+LGAP, box.y+TGAP, box.w-LGAP, box.h-BGAP-TGAP+1, BORDER_COLOR);
 
-    if (!overlay) {
-
-        // overlay large center value on top in gray
+    // overlay large center value on top in gray
+    if (label_str) {
         tft.setTextColor(BRGRAY);
         selectFontStyle (BOLD_FONT, LARGE_FONT);
         uint16_t lw, lh;
@@ -241,32 +248,16 @@ uint16_t color, float y_min, float y_max, char *label_str)
         tft.print (label_str);
     }
 
-    // printFreeHeap (F("plotXYstr"));
+    // printFreeHeap ("plotXYstr");
 
     // ok
     return (true);
-}
-
-/* shorten str IN PLACE as needed to be less that maxw pixels wide.
- * return final width in pixels.
- */
-uint16_t maxStringW (char *str, uint16_t maxw)
-{
-    uint8_t strl = strlen (str);
-    uint16_t bw = 0;
-
-    while (strl > 0 && (bw = getTextWidth(str)) >= maxw)
-        str[--strl] = '\0';
-
-    return (bw);
 }
 
 /* print weather info in the given box
  */
 void plotWX (const SBox &box, uint16_t color, const WXInfo &wi)
 {
-    resetWatchdog();
-
     // prep
     prepPlotBox (box);
 
@@ -280,8 +271,8 @@ void plotWX (const SBox &box, uint16_t color, const WXInfo &wi)
     // large temperature with degree symbol and units
     tft.setTextColor(color);
     selectFontStyle (BOLD_FONT, LARGE_FONT);
-    f = useMetricUnits() ? wi.temperature_c : 9*wi.temperature_c/5+32;
-    sprintf (buf, "%.0f %c", f, useMetricUnits() ? 'C' : 'F');
+    f = showTempC() ? wi.temperature_c : CEN2FAH(wi.temperature_c);
+    snprintf (buf, sizeof(buf), "%.0f %c", f, showTempC() ? 'C' : 'F');
     w = maxStringW (buf, box.w-attr_w);
     tft.setCursor (box.x+(box.w-attr_w-w)/2, box.y+dy);
     tft.print(buf);
@@ -308,10 +299,10 @@ void plotWX (const SBox &box, uint16_t color, const WXInfo &wi)
         // main info line
 
         selectFontStyle (LIGHT_FONT, SMALL_FONT);
-        if (useMetricUnits())
-            sprintf (buf, _FX("%.0f%% %.0f"), wi.humidity_percent, wi.pressure_hPa);
+        if (showATMhPa())
+            snprintf (buf, sizeof(buf), "%.0f%% %.0f", wi.humidity_percent, wi.pressure_hPa);
         else
-            sprintf (buf, _FX("%.0f%% %.2f"), wi.humidity_percent, wi.pressure_hPa/33.8639);
+            snprintf (buf, sizeof(buf), "%.0f%% %.2f", wi.humidity_percent, HPA2INHG(wi.pressure_hPa));
         w = maxStringW (buf, box.w-attr_w-PCHG_W-PCHG_LW-2*PCHG_LG);
         tft.setCursor (box.x+(box.w-attr_w-w-PCHG_W-PCHG_LW-2*PCHG_LG)/2, box.y+dy);
         tft.print (buf);
@@ -321,7 +312,7 @@ void plotWX (const SBox &box, uint16_t color, const WXInfo &wi)
         uint16_t pchg_x = tft.getCursorX() + PCHG_LG;
         uint16_t pchg_y = tft.getCursorY() - PCHG_H - 1;
         selectFontStyle (LIGHT_FONT, FAST_FONT);
-        if (useMetricUnits()) {
+        if (showATMhPa()) {
             tft.setCursor (pchg_x, pchg_y); tft.print ("h");
             tft.setCursor (pchg_x, pchg_y+8); tft.print ("P");
             tft.setCursor (pchg_x, pchg_y+14); tft.print ("a");
@@ -353,10 +344,10 @@ void plotWX (const SBox &box, uint16_t color, const WXInfo &wi)
         // no pressure change symbol
 
         selectFontStyle (LIGHT_FONT, SMALL_FONT);
-        if (useMetricUnits())
-            sprintf (buf, _FX("%.0f%% %.0f hPa"), wi.humidity_percent, wi.pressure_hPa);
+        if (showATMhPa())
+            snprintf (buf, sizeof(buf), "%.0f%% %.0f hPa", wi.humidity_percent, wi.pressure_hPa);
         else
-            sprintf (buf, _FX("%.0f%% %.2f in"), wi.humidity_percent, wi.pressure_hPa/33.8639);
+            snprintf (buf, sizeof(buf), "%.0f%% %.2f in", wi.humidity_percent,HPA2INHG(wi.pressure_hPa));
         w = maxStringW (buf, box.w-attr_w);
         tft.setCursor (box.x+(box.w-attr_w-w)/2, box.y+dy);
         tft.print (buf);
@@ -366,12 +357,12 @@ void plotWX (const SBox &box, uint16_t color, const WXInfo &wi)
 
     // wind
     selectFontStyle (LIGHT_FONT, SMALL_FONT);
-    f = (useMetricUnits() ? 3.6 : 2.237) * wi.wind_speed_mps; // kph or mph
-    sprintf (buf, _FX("%s @ %.0f %s"), wi.wind_dir_name, f, useMetricUnits() ? "kph" : "mph");
+    f = (showDistKm() ? 3.6 : 2.237) * wi.wind_speed_mps; // kph or mph
+    snprintf (buf, sizeof(buf), "%s @ %.0f %s", wi.wind_dir_name, f, showDistKm() ? "kph" : "mph");
     w = maxStringW (buf, box.w-attr_w);
     if (buf[strlen(buf)-1] != 'h') {
         // try shorter string in case of huge speed
-        sprintf (buf, _FX("%s @ %.0f%s"), wi.wind_dir_name, f, useMetricUnits() ? "k/h" : "m/h");
+        snprintf (buf, sizeof(buf),"%s @ %.0f%s", wi.wind_dir_name, f, showDistKm() ? "k/h" : "m/h");
         w = maxStringW (buf, box.w-attr_w);
     }
     tft.setCursor (box.x+(box.w-attr_w-w)/2, box.y+dy);
@@ -393,7 +384,7 @@ void plotWX (const SBox &box, uint16_t color, const WXInfo &wi)
         tft.print (wi.attribution[i]);
     }
 
-    // printFreeHeap (F("plotWX"));
+    // printFreeHeap ("plotWX");
 }
 
 
@@ -401,34 +392,33 @@ void plotWX (const SBox &box, uint16_t color, const WXInfo &wi)
  *   1. when called by updateBandConditions(), we are given a table containing relative propagation values
  *      for each band and a summary line to be drawn across the bottom.
  *   2. we can also be called just to update annotation as indicated by bmp or cfg_str being NULL. In this
- *      case we only draw the band indicators showing prop_map according to busy with the others normal
+ *      case we only draw the band indicators in toa/rel_band according to busy with the others normal
  *      and we redraw the time line according to bc_utc_tl.
  * bmp is a matrix of 24 rows of UTC 0 .. 23, 8 columns of bands 80-40-30-20-17-15-12-10.
  * we draw the matrix rotated so rows go up from 80 and cols start on the left at the current DE hour.
  * busy means <0 err, 0 idle, >0 active.
  * N.B. coordinate the layout geometry with checkBCTouch()
  */
-void plotBandConditions (const SBox &box, int busy, const BandMatrix *bmp, char *cfg_str)
+void plotBandConditions (const SBox &box, int busy, const BandCdtnMatrix *bmp, char *cfg_str)
 {
-    resetWatchdog();
-
     // layout
-    #define PFONT_H 6                                   // plot labels font height
+    #define PFONT_H 7                                   // plot labels font height
+    #define PFONT_W 7                                   // plot labels font width
     #define PLOT_ROWS BMTRX_COLS                        // plot rows
     #define PLOT_COLS BMTRX_ROWS                        // plot columns
-    #define TOP_B 27                                    // top border -- match VOACAP
-    #define PGAP 5                                      // gap between title and plot
+    #define TOP_B PANETITLE_H                           // top border
     #define PBOT_B 20                                   // plot bottom border -- room for config and time
-    #define PLEFT_B 16                                  // left border -- room for band
-    #define PRIGHT_B 16                                 // right border -- room for freq
-    #define PTOP_Y (box.y + TOP_B + PGAP)               // plot top y
+    #define PLEFT_B 27                                  // left border -- room for band
+    #define PRIGHT_B 14                                 // right border
+    #define PTOP_Y (box.y + SUBTITLE_Y0)                // plot top y
     #define PBOT_Y (box.y+box.h-PBOT_B)                 // plot bottom y
     #define PLEFT_X (box.x + PLEFT_B)                   // plot left x
     #define PRIGHT_X (box.x+box.w-PRIGHT_B)             // plot right x
-    #define PLOT_W (PRIGHT_X - PLEFT_X)                 // plot width
+    #define PLOT_W (PRIGHT_X - PLEFT_X + 1)             // plot width
     #define PLOT_H (PBOT_Y - PTOP_Y)                    // plot height
-    #define PCOL_W (PLOT_W/PLOT_COLS-1)                 // plot column width
-    #define PROW_H (PLOT_H/PLOT_ROWS-1)                 // plot row height
+    #define PCOL_W (PLOT_W/PLOT_COLS)                 // plot column width
+    #define PROW_H (PLOT_H/PLOT_ROWS)                 // plot row height
+    #define RELTOA_COLOR RGB565(0x58,0xa0,0xc8)         // TOA/REL marker color
 
     // to help organize the matrix rotation, p_ variables refer to plot indices, m_ to matrix indices
 
@@ -439,50 +429,48 @@ void plotBandConditions (const SBox &box, int busy, const BandMatrix *bmp, char 
     if (draw_all)
         prepPlotBox (box);
 
-    // label band names and freqs -- indicate current voacap map, if any
+    // label band names and indicate current voacap band, if any
     selectFontStyle (LIGHT_FONT, FAST_FONT);
     tft.setTextColor(GRAY);
     for (int p_row = 0; p_row < PLOT_ROWS; p_row++) {
 
         // find row and desired bg color
         uint16_t y = PBOT_Y - PLOT_H*(p_row+1)/PLOT_ROWS;
-        uint16_t rect_col = p_row == prop_map ? (busy > 0 ? DYELLOW : (busy < 0 ? RA8875_RED : RA8875_WHITE))
-                                              : RA8875_BLACK;
+        bool toa_active = IS_CMROT(CM_PMTOA) && p_row == cm_info[CM_PMTOA].band;
+        bool rel_active = IS_CMROT(CM_PMREL) && p_row == cm_info[CM_PMREL].band;
+        uint16_t band_bg = (toa_active || rel_active)
+                                ? (busy > 0 ? RA8875_YELLOW : (busy < 0 ? RA8875_RED : RA8875_WHITE))
+                                : RA8875_BLACK;
 
-        // background
-        tft.fillRect (box.x+1, y+1, PLEFT_B-2, PFONT_H+4, rect_col);
-        tft.fillRect (box.x+box.w-PRIGHT_B, y+1, PRIGHT_B-2, PFONT_H+4, rect_col);
+        // show band
+        tft.fillRect (box.x+1, y+1, 2*PFONT_W-1, PFONT_H+3, band_bg);
+        tft.setCursor (box.x+1, y + LISTING_OS);
+        tft.print (propBand2Band((PropMapBand)p_row));
 
-        // text
-        tft.setCursor (box.x+2, y + 2);
-        tft.print (propMap2Band((PropMapSetting)p_row));
-        tft.setCursor (box.x+box.w-PRIGHT_B+1, y + 2);
-        tft.printf ("%2.0f", propMap2MHz((PropMapSetting)p_row));
+        // show whether REL
+        tft.fillCircle (PLEFT_X - PRIGHT_B/2, y+PROW_H/2, 3, rel_active ? RELTOA_COLOR : RA8875_BLACK);
+
+        // show whether TOA
+        tft.fillCircle (box.x + box.w - PRIGHT_B/2, y+PROW_H/2, 3, toa_active ? RELTOA_COLOR : RA8875_BLACK);
     }
 
     // find utc and DE hour now. these will be the matrix row in plot column 0.
     int utc_hour_now = hour (nowWO());
-    int de_hour_now = hour (nowWO() + de_tz.tz_secs);
+    int de_hour_now = hour (nowWO() + getTZ (de_tz));
     int hr_now = bc_utc_tl ? utc_hour_now : de_hour_now;
 
     // erase timeline if not drawing all (because prepPlotBox() already erased everything if draw_all)
-    uint16_t timeline_y = PBOT_Y+1;
+    uint16_t timeline_y = PBOT_Y+2;
     if (!draw_all)
-        tft.fillRect (box.x + 1, timeline_y, box.w-2, PFONT_H+1, RA8875_BLACK);
+        tft.fillRect (box.x + 1, timeline_y-1, box.w-2, PFONT_H+1, RA8875_BLACK);
 
     // label timeline local or utc wth local DE now always on left end
     selectFontStyle (LIGHT_FONT, FAST_FONT);
     tft.setCursor (box.x+2, timeline_y);
     if (bc_utc_tl) {
-        // squeeze UTC label
         tft.setTextColor(GRAY);
-        tft.print ((char)'U');
-        tft.setCursor (box.x+6, timeline_y);
-        tft.print ((char)'T');
-        tft.setCursor (box.x+10, timeline_y);
-        tft.print ((char)'C');
+        tft.print ("UTC");
     } else {
-        // normal DE label fits ok
         tft.setTextColor(DE_COLOR);
         tft.print ("DE");
     }
@@ -493,12 +481,12 @@ void plotBandConditions (const SBox &box, int busy, const BandMatrix *bmp, char 
         uint16_t x = PLEFT_X + PLOT_W*p_col/PLOT_COLS;
         if (hr >= 10) {
             // close packing centered
-            tft.setCursor (x-3, timeline_y);
+            tft.setCursor (x-2, timeline_y);
             tft.print (hr/10);
-            tft.setCursor (x+1, timeline_y);
+            tft.setCursor (x+2, timeline_y);
             tft.print (hr%10);
         } else {
-            tft.setCursor (x-1, timeline_y);
+            tft.setCursor (x, timeline_y);
             tft.print (hr);
         }
     }
@@ -510,7 +498,7 @@ void plotBandConditions (const SBox &box, int busy, const BandMatrix *bmp, char 
     // center title across the top
     selectFontStyle (LIGHT_FONT, SMALL_FONT);
     tft.setTextColor(RA8875_WHITE);
-    const char *title = _FX("VOACAP DE-DX");
+    const char *title = "VOACAP DE-DX";
     uint16_t tw = getTextWidth (title);
     tft.setCursor (box.x+(box.w-tw)/2, box.y + TOP_B);
     tft.print ((char*)title);
@@ -528,17 +516,16 @@ void plotBandConditions (const SBox &box, int busy, const BandMatrix *bmp, char 
         uint16_t p_x = PLEFT_X + PLOT_W*p_col/PLOT_COLS;
         for (int m_col = 0; m_col < BMTRX_COLS; m_col++) {
             // get reliability
-            uint8_t rel = (*bmp)[m_row][m_col];
+            uint8_t rel = bmp->m[m_row][m_col];
 
             // choose color similar to fetchVOACAPArea.pl
             // rel:    0     10         33         66          100
             // color: black   |   red    |  yellow  |   green
             // hue:      x         0          43          85
-            uint8_t h, s = 250, v, r, g, b;
+            uint8_t h, s = 250, v;
             v = rel < 10 ? 0 : 250;
             h = rel < 33 ? 0 : (rel < 66 ? 43 : 85);
-            hsvtorgb (&r, &g, &b, h, s, v);
-            uint16_t color = RGB565 (r, g, b);
+            uint16_t color = HSV_2_RGB565 (h, s, v);
 
             // draw color box
             int p_row = m_col;
@@ -547,45 +534,113 @@ void plotBandConditions (const SBox &box, int busy, const BandMatrix *bmp, char 
         }
     }
 
-    printFreeHeap (F("plotBandConditions"));
+    // grid lines
+    for (int p_col = 0; p_col <= PLOT_COLS; p_col++) {
+        uint16_t x = PLEFT_X + PLOT_W*p_col/PLOT_COLS;
+        tft.drawLine (x, PBOT_Y, x, PTOP_Y, GRID_COLOR);
+    }
+    for (int p_row = 0; p_row <= PLOT_ROWS; p_row++) {
+        uint16_t y = PTOP_Y + PLOT_H*p_row/PLOT_ROWS;
+        tft.drawLine (PLEFT_X, y, PRIGHT_X+1, y, GRID_COLOR);   // same y as box so extend to box edge
+    }
+
 }
 
 /* print the NOAA RSG Space Weather Scales in the given box.
+ * return whether at least the data transaction was valid.
  */
-void plotNOAASWx (const SBox &box, const NOAASpaceWx &noaaspw)
+bool plotNOAASWx (const SBox &box)
 {
-    resetWatchdog();
-
     // prep
     prepPlotBox (box);
 
+    // fetch
+    NOAASpaceWxData noaa;
+    if (!retrieveNOAASWx(noaa)) {
+        plotMessage (box, RA8875_RED, "NOAA connection failed");
+        return (false);
+    } else if (!noaa.data_ok) {
+        plotMessage (box, RA8875_RED, "NOAA data invalid");
+        return (true);                                                  // transaction itself was ok
+    }
+
     // title
-    tft.setTextColor(RA8875_YELLOW);
+    tft.setTextColor(NOAASPW_COLOR);
     selectFontStyle (LIGHT_FONT, SMALL_FONT);
-    uint16_t h = box.h/5-2;                             // text row height
-    const char *title = _FX("NOAA SpaceWx");
+    const char title[] = "NOAA SpaceWx";
     uint16_t bw = getTextWidth (title);
-    tft.setCursor (box.x+(box.w-bw)/2, box.y+h);
+    tft.setCursor (box.x+(box.w-bw)/2, box.y+PANETITLE_H);
     tft.print (title);
 
+    // scale
+    selectFontStyle (LIGHT_FONT, FAST_FONT);
+    const char scale_msg[] = "Scale 0 - 5";
+    uint16_t sw = getTextWidth (scale_msg);
+    tft.setCursor (box.x+(box.w-sw)/2, box.y+SUBTITLE_Y0);
+    tft.print (scale_msg);
+
     // print each line
+    uint16_t table_y0 = box.y + PANETITLE_H + 20;
+    uint16_t table_h = (box.y + box.h - 5) - table_y0;
+    uint16_t label_x0 = box.x + 6;
+    uint16_t value_x0 = label_x0 + 10 * FONTW;
+    uint16_t value_w = (box.x + box.w - value_x0)/N_NOAASW_V;
+    uint16_t footer_y = box.y + box.h - 12;
+
     for (int i = 0; i < N_NOAASW_C; i++) {
 
-        uint16_t w = box.w/7-1;
-        h += box.h/4;
-        tft.setCursor (box.x+w+(i==2?-2:0), box.y+h);   // tweak G to better center
-        tft.setTextColor(GRAY);
-        tft.print (noaaspw.cat[i]);
+        // label
+        selectFontStyle (LIGHT_FONT, FAST_FONT);
+        uint16_t label_y = table_y0 + i*table_h/N_NOAASW_C;             // font baseline is at top
+        tft.setTextColor(NOAASPW_COLOR);
+        tft.setCursor (label_x0, label_y);
+        switch (noaa.cat[i]) {
+        case 'R':
+            tft.print ("Radio");
+            tft.setCursor (label_x0, label_y += FONTH+2);
+            tft.print ("blackout");
+            break;
+        case 'S':
+            tft.print ("Solar");
+            tft.setCursor (label_x0, label_y += FONTH+2);
+            tft.print ("storm");
+            break;
+        case 'G':
+            tft.print ("Magnetic");
+            tft.setCursor (label_x0, label_y += FONTH+2);
+            tft.print ("storm");
+            break;
+        default:
+            fatalError ("bogus noaa sw category: %c %d", noaa.cat[i], noaa.cat[i]);
+            break;                                                      // lint
+        }
 
-        w += box.w/10;
+        // value and label below
+        uint16_t value_y = table_y0 + i*table_h/N_NOAASW_C + 19;        // font baseline is at bottom
         for (int j = 0; j < N_NOAASW_V; j++) {
-            int val = noaaspw.val[i][j];
-            w += box.w/7;
-            tft.setCursor (box.x+w, box.y+h);
+            selectFontStyle (LIGHT_FONT, SMALL_FONT);
+            uint16_t value_x = value_x0 + j*value_w;
+            int val = noaa.val[i][j];
+            tft.setCursor (value_x, value_y);
             tft.setTextColor(val == 0 ? RA8875_GREEN : (val <= 3 ? RA8875_YELLOW : RA8875_RED));
             tft.print (val);
         }
     }
+
+    // labels below
+    selectFontStyle (LIGHT_FONT, FAST_FONT);
+    tft.setTextColor(NOAASPW_COLOR);
+    for (int i = 0; i < N_NOAASW_V; i++) {
+        uint16_t value_x = value_x0 + i*value_w - 3;
+        tft.setCursor (value_x, footer_y);
+        if (i == 0)
+            tft.print ("Now");
+        else
+            tft.printf ("D+%d", i);
+    }
+
+    // ok
+    return (true);
 }
 
 
@@ -594,7 +649,7 @@ void plotNOAASWx (const SBox &box, const NOAASpaceWx &noaaspw)
 void plotMessage (const SBox &box, uint16_t color, const char *message)
 {
     // log
-    Serial.printf (_FX("PlotMsg: %s\n"), message);
+    Serial.printf ("PlotMsg: %s\n", message);
 
     // prep font
     selectFontStyle (BOLD_FONT, FAST_FONT);
@@ -610,7 +665,6 @@ void plotMessage (const SBox &box, uint16_t color, const char *message)
     uint16_t y = box.y + box.h/4;
 
     // show up to at least a few lines
-    resetWatchdog();
     for (int n_lines = 0; n_lines < 5 && msg_printed < msg_len; n_lines++) {
 
         // chop at max width -- maxStringW overwrites all beyond with 0's
@@ -647,50 +701,45 @@ void prepPlotBox (const SBox &box)
     // erase all
     fillSBox (box, RA8875_BLACK);
 
-    // not bottom so it appears to connect with map top
+    // not bottom so it appears to connect with map top...
     uint16_t rx = box.x+box.w-1;
     uint16_t by = box.y+box.h-1;
     tft.drawLine (box.x, box.y, box.x, by, BORDER_COLOR);               // left
     tft.drawLine (box.x, box.y, rx, box.y, BORDER_COLOR);               // top
     tft.drawLine (rx, box.y, rx, by, BORDER_COLOR);                     // right
+
+    // ... unless showing de/dx pane
+    if (memcmp (&box, &plot_b[PANE_0], sizeof(SBox)) == 0)
+        tft.drawLine (box.x, by, rx, by, BORDER_COLOR);                 // bottom
 }
 
-/* given min and max and an approximate number of divisions desired,
- * fill in ticks[] with nicely spaced values and return how many.
- * N.B. return value, and hence number of entries to ticks[], might be as
- *   much as 2 more than numdiv.
+/* install the given BMP image into the given box, resizing and padding with black as necessary.
+ * return whether all ok else false with brief reason in ynot
  */
-static int tickmarks (float min, float max, int numdiv, float ticks[])
+bool installBMPBox (GenReader &gr, const SBox &box, ImageRefit fit, Message &ynot)
 {
-    static int factor[] = { 1, 2, 5 };
-    #define NFACTOR    NARRAY(factor)
-    float minscale;
-    float delta;
-    float lo;
-    float v;
-    int n;
+    // prep box with black
+    fillSBox (box, RA8875_BLACK);
 
-    minscale = fabsf (max - min);
+    // draw to full raw resolution
+    SBox raw_b;
+    raw_b.x = box.x * tft.SCALESZ;
+    raw_b.y = box.y * tft.SCALESZ;
+    raw_b.w = box.w * tft.SCALESZ;
+    raw_b.h = box.h * tft.SCALESZ;
 
-    if (minscale == 0) {
-        /* null range: return ticks in range min-1 .. min+1 */
-        for (n = 0; n < numdiv; n++)
-            ticks[n] = min - 1.0 + n*2.0/numdiv;
-        return (numdiv);
-    }
+    // read image fit to raw box dimensions
+    uint16_t *pix_565;
+    if (!readBMPImage (gr, raw_b, pix_565, fit, ynot))
+        return (false);
 
-    delta = minscale/numdiv;
-    for (n=0; n < (int)NFACTOR; n++) {
-        float scale;
-        float x = delta/factor[n];
-        if ((scale = (powf(10.0F, ceilf(log10f(x)))*factor[n])) < minscale)
-            minscale = scale;
-    }
-    delta = minscale;
+    // fill raw_b with image
+    uint16_t *pix = pix_565;
+    for (int dy = 0; dy < raw_b.h; dy++)
+        for (int dx = 0; dx < raw_b.w; dx++)
+            tft.drawPixelRaw (raw_b.x+dx, raw_b.y+dy, *pix++);
 
-    lo = floor(min/delta);
-    for (n = 0; (v = delta*(lo+n)) < max+delta; )
-        ticks[n++] = v;
-
-    return (n);
+    // ok
+    free (pix_565);
+    return (true);
 }

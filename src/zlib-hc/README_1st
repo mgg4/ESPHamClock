@@ -1,0 +1,3 @@
+minimal zlib copy for HamClock.
+no code changes other than removing register storage class in order to build clean with g++.
+required in order to use just compression without archives.

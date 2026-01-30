@@ -44,6 +44,7 @@ void hsvtorgb(uint8_t *r, uint8_t *g, uint8_t *b, uint8_t h, uint8_t s, uint8_t 
     return;
 }
 
+
 /* RGB to HSV conversion function with only integer math.
  */
 void rgbtohsv(uint8_t *h, uint8_t *s, uint8_t *v, uint8_t r, uint8_t g, uint8_t b)
@@ -75,3 +76,26 @@ void rgbtohsv(uint8_t *h, uint8_t *s, uint8_t *v, uint8_t r, uint8_t g, uint8_t 
     else
         *h = 171 + 43 * (r - g) / (rgbMax - rgbMin);
 }
+
+/* handy function to get h, s, v from RGB565
+ */
+void RGB565_2_HSV (uint16_t rgb565, uint8_t *hp, uint8_t *sp, uint8_t *vp)
+{
+    uint8_t r = RGB565_R (rgb565);
+    uint8_t g = RGB565_G (rgb565);
+    uint8_t b = RGB565_B (rgb565);
+    rgbtohsv (hp, sp, vp, r, g, b);
+
+}
+
+
+/* handy function to get RGB565 pixel from h, s, v
+ */
+uint16_t HSV_2_RGB565 (uint8_t h, uint8_t s, uint8_t v) 
+{
+    uint8_t r, g, b;
+
+    hsvtorgb (&r, &g, &b, h, s, v);
+    return (RGB565(r,g,b));
+}
+
